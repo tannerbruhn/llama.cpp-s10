@@ -5,6 +5,9 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#ifdef GGML_S10_GPU_ASSIST
+#include "s10-gpu-assist.h"
+#endif
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1422,6 +1425,16 @@ UseGgmlGemm1:;
     #endif
     }
 
+#ifdef GGML_S10_GPU_ASSIST
+    // leading src0 rows computed by the GPU; written by thread 0, read by all after the barrier
+    static int64_t s10ga_rows;
+    if (ith == 0) {
+        s10ga_rows = params->use_ref ? 0 : ggml_s10ga_begin(src0, src1);
+    }
+#else
+    const int64_t s10ga_rows = 0;
+#endif
+
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
@@ -1429,8 +1442,10 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
+    const int64_t ir0_base = s10ga_rows;
+
 #if GGML_USE_LLAMAFILE
-    if (!params->use_ref && src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type && ir0_base == 0) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1454,7 +1469,8 @@ UseGgmlGemm2:;
 #endif
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const int64_t nr0 = ne0;
+    // (minus the leading rows the GPU computes)
+    const int64_t nr0 = ne0 - ir0_base;
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -1493,8 +1509,8 @@ UseGgmlGemm2:;
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
 
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        const int64_t ir0_start = ir0_base + dr0 * ith0;
+        const int64_t ir0_end = MIN(ir0_start + dr0, ir0_base + nr0);
 
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
@@ -1515,6 +1531,12 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+
+#ifdef GGML_S10_GPU_ASSIST
+    if (ith == 0 && ir0_base > 0) {
+        ggml_s10ga_end(dst, ir0_base);
+    }
+#endif
 }
 
 // ggml_compute_forward_mul_mat_id
