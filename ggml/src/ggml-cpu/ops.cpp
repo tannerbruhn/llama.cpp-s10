@@ -5593,6 +5593,40 @@ static void ggml_compute_forward_set_rows_impl(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
+    // S10: a single-token update has fewer rows than threads (e.g. one whole recurrent state per sequence), so
+    // the row split leaves all but one thread idle. For element-wise destination types, split each row's
+    // columns across the threads instead.
+    static const bool s10_split = !(getenv("GGML_S10_SETROWS_SPLIT") && atoi(getenv("GGML_S10_SETROWS_SPLIT")) == 0);
+    if (s10_split && nr*ne02*ne03 < nth && ggml_blck_size(dst->type) == 1 && nc >= 64*nth &&
+        (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16) &&
+        (std::is_same_v<src_t, float> || dst->type == GGML_TYPE_F16)) {
+        const int64_t dc = ((nc + nth - 1)/nth + 15) & ~(int64_t) 15;
+        const int64_t c0 = std::min(dc*ith, nc);
+        const int64_t c1 = std::min(c0 + dc, nc);
+        if (c1 <= c0) {
+            return;
+        }
+        const size_t es_src = ggml_type_size(src0->type), es_dst = ggml_type_size(dst->type);
+        for (int64_t i03 = 0; i03 < ne03; ++i03) {
+            for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                for (int64_t i = 0; i < nr; ++i) {
+                    const int64_t i12 = i03%ne12;
+                    const int64_t i11 = i02%ne11;
+                    const int64_t i1 = *(idx_t *) ((char *) src1->data + i*nb10 + i11*nb11 + i12*nb12);
+                    GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                    const char * s = (const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03 + c0*es_src;
+                    char       * d = (char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3 + c0*es_dst;
+                    if constexpr (std::is_same_v<src_t, float>) {
+                        from_float((const float *) s, d, c1 - c0);
+                    } else {
+                        memcpy(d, s, (c1 - c0)*es_dst);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             for (int64_t i = ir0; i < ir1; ++i) {
