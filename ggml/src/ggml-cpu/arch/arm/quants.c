@@ -1570,6 +1570,99 @@ static inline void ggml_ptq1_0_decode_neon(const block_ptq1_0 * GGML_RESTRICT b,
 }
 #endif
 
+#ifndef GGML_PTQ1_LEAN
+#define GGML_PTQ1_LEAN 1
+#endif
+
+#ifndef GGML_PTQ1_LEAN2
+#define GGML_PTQ1_LEAN2 0
+#endif
+#ifndef GGML_PTQ1_PREFETCH
+#define GGML_PTQ1_PREFETCH 0
+#endif
+#if GGML_PTQ1_LEAN && GGML_PTQ1_LEAN2
+#error "GGML_PTQ1_LEAN and GGML_PTQ1_LEAN2 are mutually exclusive"
+#endif
+#if GGML_PTQ1_PREFETCH < 0
+#error "GGML_PTQ1_PREFETCH must be a nonnegative byte distance"
+#endif
+
+#if GGML_PTQ1_LEAN && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+// Tail TBL indices put the trits in element order; Q8_0 stays unchanged.
+static inline void ggml_ptq1_0_decode_lean(const block_ptq1_0 * GGML_RESTRICT b, int8x16_t e[8]) {
+    static const uint8_t idx01[16] = {4,5,6,7,8,9,10,11,4,5,6,7,8,9,10,11};
+    static const uint8_t pow01[16] = {1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3};
+    static const uint8_t idx4h[16] = {4,5,6,7,8,9,10,11,12,13,12,13,12,13,12,13};
+    static const uint8_t pow4h[16] = {81,81,81,81,81,81,81,81,1,1,3,3,9,9,27,27};
+#define PTQ1_LEAN_TRIT(v) vreinterpretq_s8_u8(vsubq_u8(vcltq_u8((v), vdupq_n_u8(86)), vcgtq_u8((v), vdupq_n_u8(170))))
+    const uint8x16_t a = vld1q_u8(b->qs);
+    e[0] = PTQ1_LEAN_TRIT(a);
+    e[1] = PTQ1_LEAN_TRIT(vmulq_u8(a, vdupq_n_u8(3)));
+    e[2] = PTQ1_LEAN_TRIT(vmulq_u8(a, vdupq_n_u8(9)));
+    e[3] = PTQ1_LEAN_TRIT(vmulq_u8(a, vdupq_n_u8(27)));
+    e[4] = PTQ1_LEAN_TRIT(vmulq_u8(a, vdupq_n_u8(81)));
+
+    // This load ends at the block boundary, including the last block.
+    const uint8x16_t tail = vld1q_u8((const uint8_t *) (const void *) b + 12);
+    const uint8x16_t t = vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx01)), vld1q_u8(pow01));
+    e[5] = PTQ1_LEAN_TRIT(t);
+    e[6] = PTQ1_LEAN_TRIT(vmulq_u8(t, vdupq_n_u8(9)));
+    e[7] = PTQ1_LEAN_TRIT(vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx4h)), vld1q_u8(pow4h)));
+#undef PTQ1_LEAN_TRIT
+}
+#endif
+
+#if GGML_PTQ1_LEAN2 && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+// Keep decoded pairs local; no running integer sums or scale scratch arrays.
+static inline float ggml_ptq1_0_dot_lean2(int nb, const block_ptq1_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y, size_t prefetch) {
+    static const uint8_t idx01[16] = {4,5,6,7,8,9,10,11,4,5,6,7,8,9,10,11};
+    static const uint8_t pow01[16] = {1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3};
+    static const uint8_t idx4h[16] = {4,5,6,7,8,9,10,11,12,13,12,13,12,13,12,13};
+    static const uint8_t pow4h[16] = {81,81,81,81,81,81,81,81,1,1,3,3,9,9,27,27};
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+
+#define PTQ1_LEAN2_TRIT(v) vreinterpretq_s8_u8(vsubq_u8(vcltq_u8((v), vdupq_n_u8(86)), vcgtq_u8((v), vdupq_n_u8(170))))
+#pragma GCC unroll 1
+    for (int i = 0; i < nb; ++i) {
+        const block_ptq1_0 * xb = &x[i];
+        const block_q8_0 * yb = &y[4*i];
+        if (prefetch) {
+            __builtin_prefetch((const void *) ((uintptr_t) xb + prefetch), 0, 3);
+        }
+        uint8x16_t a = vld1q_u8(xb->qs);
+        int32x4_t p0 = vdotq_s32(vdupq_n_s32(0), PTQ1_LEAN2_TRIT(a), vld1q_s8(yb[0].qs));
+        p0 = vdotq_s32(p0, PTQ1_LEAN2_TRIT(vmulq_u8(a, vdupq_n_u8(3))), vld1q_s8(yb[0].qs + 16));
+        // Empty compiler barriers bound decode scheduling; they emit no instructions.
+        __asm__ __volatile__("" : "+w" (p0), "+w" (a));
+        int32x4_t p1 = vdotq_s32(vdupq_n_s32(0), PTQ1_LEAN2_TRIT(vmulq_u8(a, vdupq_n_u8(9))), vld1q_s8(yb[1].qs));
+        p1 = vdotq_s32(p1, PTQ1_LEAN2_TRIT(vmulq_u8(a, vdupq_n_u8(27))), vld1q_s8(yb[1].qs + 16));
+        int32x4_t p01 = vpaddq_s32(p0, p1);
+        // Finish these dots before loading the tail to bound vector liveness.
+        __asm__ __volatile__("" : "+w" (p01), "+w" (a) : : "memory");
+
+        // The tail load ends at the block boundary. TBL keeps ordinary Q8 order.
+        uint8x16_t tail = vld1q_u8((const uint8_t *) (const void *) xb + 12);
+        uint8x16_t t = vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx01)), vld1q_u8(pow01));
+        int32x4_t p2 = vdotq_s32(vdupq_n_s32(0), PTQ1_LEAN2_TRIT(vmulq_u8(a, vdupq_n_u8(81))), vld1q_s8(yb[2].qs));
+        p2 = vdotq_s32(p2, PTQ1_LEAN2_TRIT(t), vld1q_s8(yb[2].qs + 16));
+        __asm__ __volatile__("" : "+w" (p2), "+w" (t), "+w" (tail));
+        int32x4_t p3 = vdotq_s32(vdupq_n_s32(0), PTQ1_LEAN2_TRIT(vmulq_u8(t, vdupq_n_u8(9))), vld1q_s8(yb[3].qs));
+        p3 = vdotq_s32(p3, PTQ1_LEAN2_TRIT(vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx4h)), vld1q_u8(pow4h))), vld1q_s8(yb[3].qs + 16));
+        const int32x4_t dots = vpaddq_s32(p01, vpaddq_s32(p2, p3));
+
+        uint16x4_t dh = vdup_n_u16(yb[0].d);
+        dh = vld1_lane_u16(&yb[1].d, dh, 1);
+        dh = vld1_lane_u16(&yb[2].d, dh, 2);
+        dh = vld1_lane_u16(&yb[3].d, dh, 3);
+        const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(dh));
+        const float dx = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(xb->d)), 0);
+        sumv = vfmaq_f32(sumv, vcvtq_f32_s32(dots), vmulq_n_f32(dy, dx));
+    }
+#undef PTQ1_LEAN2_TRIT
+    return vaddvq_f32(sumv);
+}
+#endif
+
 // PTQ1_0 x Q8_0: one 128-wide PTQ1_0 block meets four Q8_0 blocks.
 // With i8mm, nrc == 2 computes a 2x2 tile (two weight rows x two activation columns)
 // with SMMLA, so every decoded trit vector is used twice.
@@ -1598,6 +1691,10 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         float32x4_t sumv = vdupq_n_f32(0.0f);
 
         for (int i = 0; i < nb; ++i) {
+#if GGML_PTQ1_PREFETCH > 0
+            __builtin_prefetch((const void *) ((uintptr_t) &x0[i] + GGML_PTQ1_PREFETCH), 0, 3);
+            __builtin_prefetch((const void *) ((uintptr_t) &x1[i] + GGML_PTQ1_PREFETCH), 0, 3);
+#endif
             int8x16_t e0[8];
             int8x16_t e1[8];
             ggml_ptq1_0_decode_neon(&x0[i], e0);
@@ -1651,9 +1748,49 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     const block_ptq1_0 * GGML_RESTRICT x = vx;
     const block_q8_0   * GGML_RESTRICT y = vy;
 
+#if GGML_PTQ1_LEAN2 && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+    *s = ggml_ptq1_0_dot_lean2(nb, x, y, GGML_PTQ1_PREFETCH);
+#elif GGML_PTQ1_LEAN && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+    int32x4_t run[4] = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
+    uint32_t last[4] = {0};
+    float sa = 0.0f, sb = 0.0f;
+
+#pragma GCC unroll 2
+    for (int i = 0; i < nb; ++i) {
+#if GGML_PTQ1_PREFETCH > 0
+        __builtin_prefetch((const void *) ((uintptr_t) &x[i] + GGML_PTQ1_PREFETCH), 0, 3);
+#endif
+        int8x16_t e[8];
+        ggml_ptq1_0_decode_lean(&x[i], e);
+
+        // Q8 scales are strided; gather four halves before one vector conversion.
+        const uint16_t dh[4] = { y[4*i].d, y[4*i + 1].d, y[4*i + 2].d, y[4*i + 3].d };
+        const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(dh)));
+        float v[4];
+        for (int k = 0; k < 4; ++k) {
+            run[k] = vdotq_s32(run[k], e[2*k], vld1q_s8(y[4*i + k].qs));
+            run[k] = vdotq_s32(run[k], e[2*k + 1], vld1q_s8(y[4*i + k].qs + 16));
+            const uint32_t total = (uint32_t) vaddvq_s32(run[k]);
+            // Unsigned differences also work when the running sums wrap.
+            v[k] = (float) (int32_t) (total - last[k]);
+            last[k] = total;
+        }
+        const float32x4_t scaled = vmulq_f32(vld1q_f32(v), dy);
+        const float f = GGML_CPU_FP16_TO_FP32(x[i].d) * vaddvq_f32(scaled);
+        if (i & 1) {
+            sb += f;
+        } else {
+            sa += f;
+        }
+    }
+    *s = sa + sb;
+#else
     float32x4_t sumv = vdupq_n_f32(0.0f);
 
     for (int i = 0; i < nb; ++i) {
+#if GGML_PTQ1_PREFETCH > 0
+        __builtin_prefetch((const void *) ((uintptr_t) &x[i] + GGML_PTQ1_PREFETCH), 0, 3);
+#endif
         int8x16_t e[8];
         ggml_ptq1_0_decode_neon(&x[i], e);
 
@@ -1675,6 +1812,7 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 
     *s = vaddvq_f32(sumv);
+#endif
 #else
     ggml_vec_dot_ptq1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
