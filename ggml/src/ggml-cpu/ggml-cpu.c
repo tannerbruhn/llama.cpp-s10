@@ -1291,6 +1291,50 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         (src1_cont || src1->type != vec_dot_type);
 #endif
 
+#if defined(__aarch64__)
+    // S10 prompt path: with 8+ columns, decode each row pair once to int8 and run 2x4 blocks over all columns
+    // (GGML_PTQ1_DEC=0 turns it off). Bit-identical to the single-column kernel.
+    static int s10_dec_mode = -1;
+    if (s10_dec_mode < 0) {
+        const char * e = getenv("GGML_PTQ1_DEC");
+        s10_dec_mode = e ? atoi(e) != 0 : 1;
+    }
+    if (s10_c4 && s10_dec_mode && ir1_end - ir1_start >= 8 && ne00 <= 32768) {
+        int8_t q0[32768] __attribute__((aligned(64)));
+        int8_t q1[32768] __attribute__((aligned(64)));
+        float d0[256], d1[256];
+        const int64_t ncols4 = (ir1_end - ir1_start) / 4 * 4;
+        int64_t ir0 = ir0_start;
+        for (; ir0 + 1 < ir0_end; ir0 += 2) {
+            ggml_ptq1_0_decode_row_s10(ne00, (const char *) src0->data + ir0 * nb01, q0, d0);
+            ggml_ptq1_0_decode_row_s10(ne00, (const char *) src0->data + (ir0 + 1) * nb01, q1, d1);
+            for (int64_t ir1 = ir1_start; ir1 < ir1_start + ncols4; ir1 += 4) {
+                float r0[4], r1[4];
+                ggml_ptq1_0_dot_dec_2x4_s10(ne00, q0, q1, d0, d1, (const char *) wdata + ir1 * row_size, row_size, r0, r1);
+                for (int c = 0; c < 4; ++c) {
+                    float * dcol = (float *) ((char *) dst->data + (ir1 + c) * nb1);
+                    dcol[ir0] = r0[c];
+                    dcol[ir0 + 1] = r1[c];
+                }
+            }
+            for (int64_t ir1 = ir1_start + ncols4; ir1 < ir1_end; ++ir1) {
+                float r2[2];
+                ggml_vec_dot_ptq1_0_q8_0_x2(ne00, r2, (const char *) src0->data + ir0 * nb01, nb01, (const char *) wdata + ir1 * row_size, s10_x2_pf);
+                float * dcol = (float *) ((char *) dst->data + ir1 * nb1);
+                dcol[ir0] = r2[0];
+                dcol[ir0 + 1] = r2[1];
+            }
+        }
+        for (; ir0 < ir0_end; ++ir0) {
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+                vec_dot(ne00, (float *) ((char *) dst->data + ir1 * nb1) + ir0, 0, (const char *) src0->data + ir0 * nb01, 0,
+                        (const char *) wdata + ir1 * row_size, 0, 1);
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             int64_t ir1_first = iir1;
@@ -1561,6 +1605,14 @@ UseGgmlGemm2:;
     }
 
     // The number of elements in each chunk
+#if defined(__aarch64__)
+    // S10 prompt path: PTQ1_0 with 8+ columns decodes each row once for all columns, so keep every column in one
+    // chunk and split by rows only (16-row chunks, claimed dynamically). GGML_PTQ1_DEC=0 restores the default.
+    if (src0->type == GGML_TYPE_PTQ1_0 && nr1 >= 8 && !(getenv("GGML_PTQ1_DEC") && atoi(getenv("GGML_PTQ1_DEC")) == 0)) {
+        nchunk1 = 1;
+        nchunk0 = (nr0 + 15) / 16;
+    }
+#endif
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
@@ -3249,7 +3301,7 @@ static int ggml_cpu_try_fuse_ops(
 }
 
 // GGML_S10_OPPROF: thread 0 accumulates the wall time of each node (compute + barrier) by op kind and prints a
-// per-graph average every 32 graphs.
+// per-graph average every 32 graphs (GGML_S10_OPPROF_EVERY=N changes the window).
 #define S10P_MAX 48
 static struct { char key[48]; double t; long n; } s10p_tab[S10P_MAX];
 static int s10p_n, s10p_on = -1; static long s10p_graphs;
@@ -3268,7 +3320,9 @@ static void s10p_key(const struct ggml_tensor * node, int fused, char * key) {
     }
 }
 static void s10p_report(void) {
-    if (++s10p_graphs % 32) return;
+    static long s10p_every = 0;
+    if (!s10p_every) { const char * e = getenv("GGML_S10_OPPROF_EVERY"); s10p_every = e && atol(e) > 0 ? atol(e) : 32; }
+    if (++s10p_graphs % s10p_every) return;
     double tot = 0; for (int i = 0; i < s10p_n; i++) tot += s10p_tab[i].t;
     fprintf(stderr, "s10-opprof window: %ld graphs, %.1f ms/graph\n", s10p_graphs, tot / s10p_graphs * 1e3);
     for (int k = 0; k < s10p_n; k++) {   // sorted print, largest first

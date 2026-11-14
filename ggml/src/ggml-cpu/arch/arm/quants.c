@@ -1966,6 +1966,86 @@ void ggml_vec_dot_ptq1_0_q8_0_c4(int n, float * GGML_RESTRICT s, const void * GG
 #endif
 }
 
+// S10 prompt path: decode one PTQ1_0 row into int8 trits (Q8_0 element order) plus its fp32 block scales.
+void ggml_ptq1_0_decode_row_s10(int n, const void * GGML_RESTRICT vx, int8_t * GGML_RESTRICT q, float * GGML_RESTRICT d) {
+#if GGML_PTQ1_LEAN2 && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+    static const uint8_t idx01[16] = {4,5,6,7,8,9,10,11,4,5,6,7,8,9,10,11};
+    static const uint8_t pow01[16] = {1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3};
+    static const uint8_t idx4h[16] = {4,5,6,7,8,9,10,11,12,13,12,13,12,13,12,13};
+    static const uint8_t pow4h[16] = {81,81,81,81,81,81,81,81,1,1,3,3,9,9,27,27};
+    const int nb = n / QK_PTQ1_0;
+    const block_ptq1_0 * GGML_RESTRICT x = vx;
+#define PTQ1_DR_TRIT(v) vreinterpretq_s8_u8(vsubq_u8(vcltq_u8((v), vdupq_n_u8(86)), vcgtq_u8((v), vdupq_n_u8(170))))
+    for (int i = 0; i < nb; ++i) {
+        const block_ptq1_0 * xb = &x[i];
+        int8_t * o = q + 128*i;
+        const uint8x16_t a = vld1q_u8(xb->qs);
+        const uint8x16_t tail = vld1q_u8((const uint8_t *) (const void *) xb + 12);
+        const uint8x16_t t = vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx01)), vld1q_u8(pow01));
+        vst1q_s8(o +   0, PTQ1_DR_TRIT(a));
+        vst1q_s8(o +  16, PTQ1_DR_TRIT(vmulq_u8(a, vdupq_n_u8(3))));
+        vst1q_s8(o +  32, PTQ1_DR_TRIT(vmulq_u8(a, vdupq_n_u8(9))));
+        vst1q_s8(o +  48, PTQ1_DR_TRIT(vmulq_u8(a, vdupq_n_u8(27))));
+        vst1q_s8(o +  64, PTQ1_DR_TRIT(vmulq_u8(a, vdupq_n_u8(81))));
+        vst1q_s8(o +  80, PTQ1_DR_TRIT(t));
+        vst1q_s8(o +  96, PTQ1_DR_TRIT(vmulq_u8(t, vdupq_n_u8(9))));
+        vst1q_s8(o + 112, PTQ1_DR_TRIT(vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx4h)), vld1q_u8(pow4h))));
+        d[i] = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(xb->d)), 0);
+    }
+#undef PTQ1_DR_TRIT
+#else
+    GGML_UNUSED(n); GGML_UNUSED(vx); GGML_UNUSED(q); GGML_UNUSED(d);
+    GGML_ABORT("ggml_ptq1_0_decode_row_s10 needs the lean-v2 dotprod build");
+#endif
+}
+
+// S10 prompt path: two decoded rows x four Q8_0 columns. Same integer sums, pairwise tree and fma order as
+// the lean-v2 single-column kernel, so every result is bit-identical to it.
+void ggml_ptq1_0_dot_dec_2x4_s10(int n, const int8_t * GGML_RESTRICT q0, const int8_t * GGML_RESTRICT q1,
+                                 const float * GGML_RESTRICT d0, const float * GGML_RESTRICT d1,
+                                 const void * GGML_RESTRICT vy, size_t by, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    const int nb = n / QK_PTQ1_0;
+    const block_q8_0 * GGML_RESTRICT y[4];
+    for (int c = 0; c < 4; ++c) {
+        y[c] = (const block_q8_0 *) ((const uint8_t *) vy + c*by);
+    }
+    float32x4_t a0[4], a1[4];
+    for (int c = 0; c < 4; ++c) { a0[c] = vdupq_n_f32(0.0f); a1[c] = vdupq_n_f32(0.0f); }
+#pragma GCC unroll 1
+    for (int i = 0; i < nb; ++i) {
+        const int8_t * w0 = q0 + 128*i;
+        const int8_t * w1 = q1 + 128*i;
+        for (int c = 0; c < 4; ++c) {
+            const block_q8_0 * yb = &y[c][4*i];
+            int32x4_t r0[4], r1[4];
+            for (int k = 0; k < 4; ++k) {
+                const int8x16_t ylo = vld1q_s8(yb[k].qs), yhi = vld1q_s8(yb[k].qs + 16);
+                r0[k] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w0 + 32*k), ylo), vld1q_s8(w0 + 32*k + 16), yhi);
+                r1[k] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w1 + 32*k), ylo), vld1q_s8(w1 + 32*k + 16), yhi);
+            }
+            uint16x4_t dh = vdup_n_u16(yb[0].d);
+            dh = vld1_lane_u16(&yb[1].d, dh, 1);
+            dh = vld1_lane_u16(&yb[2].d, dh, 2);
+            dh = vld1_lane_u16(&yb[3].d, dh, 3);
+            const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(dh));
+            const int32x4_t t0 = vpaddq_s32(vpaddq_s32(r0[0], r0[1]), vpaddq_s32(r0[2], r0[3]));
+            const int32x4_t t1 = vpaddq_s32(vpaddq_s32(r1[0], r1[1]), vpaddq_s32(r1[2], r1[3]));
+            a0[c] = vfmaq_f32(a0[c], vcvtq_f32_s32(t0), vmulq_n_f32(dy, d0[i]));
+            a1[c] = vfmaq_f32(a1[c], vcvtq_f32_s32(t1), vmulq_n_f32(dy, d1[i]));
+        }
+    }
+    for (int c = 0; c < 4; ++c) {
+        s0[c] = vaddvq_f32(a0[c]);
+        s1[c] = vaddvq_f32(a1[c]);
+    }
+#else
+    GGML_UNUSED(n); GGML_UNUSED(q0); GGML_UNUSED(q1); GGML_UNUSED(d0); GGML_UNUSED(d1);
+    GGML_UNUSED(vy); GGML_UNUSED(by); GGML_UNUSED(s0); GGML_UNUSED(s1);
+    GGML_ABORT("ggml_ptq1_0_dot_dec_2x4_s10 needs dotprod");
+#endif
+}
+
 void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

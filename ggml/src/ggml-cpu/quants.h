@@ -50,6 +50,11 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_vec_dot_ptq1_0_q8_0_x2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t prefetch);
 // S10: one PTQ1_0 row against four Q8_0 columns (column stride by bytes); s[0..3].
 void ggml_vec_dot_ptq1_0_q8_0_c4(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, size_t prefetch);
+// S10 prompt path: decode a PTQ1_0 row to int8 + scales once, then 2 rows x 4 columns against Q8_0.
+void ggml_ptq1_0_decode_row_s10(int n, const void * GGML_RESTRICT vx, int8_t * GGML_RESTRICT q, float * GGML_RESTRICT d);
+void ggml_ptq1_0_dot_dec_2x4_s10(int n, const int8_t * GGML_RESTRICT q0, const int8_t * GGML_RESTRICT q1,
+                                 const float * GGML_RESTRICT d0, const float * GGML_RESTRICT d1,
+                                 const void * GGML_RESTRICT vy, size_t by, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1);
 #endif
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
