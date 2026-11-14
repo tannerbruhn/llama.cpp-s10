@@ -22,13 +22,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-// Work-group = 8 lanes x g_slots row slots, 4 rows per slot. Panfrost splits a Bifrost compute job into
-// tasks of 8 work-groups, and a task runs on one shader core, so small groups are needed to spread a
-// partial matrix over all 12 cores (GGML_S10_GPU_SLOTS, default 2: 16 work-items, 8 rows per group).
-static int g_slots = 2;
-#define S10GA_TILE_ROWS   (4 * g_slots)
-#define S10GA_LANES       8
-#define S10GA_WG          (S10GA_LANES * g_slots)
+// Keep the cached row count aligned to both kernels. Zero slots selects the tuned geometry.
+static int g_slots = 0;
+#define S10GA_TILE_ROWS   8
+#define S10GA_LANES      16
 #define S10GA_MAX_ROWS    32768  // rows per dispatch, keeps each GPU job short (Panfrost job timeout)
 #define S10GA_TABLE       4096
 
@@ -59,7 +56,7 @@ static int        g_check;
 static double     g_min_bytes;   // GGML_S10_GPU_MINMB: only tensors at least this big (MiB) get GPU rows
 static cl_context g_ctx;
 static cl_command_queue g_q;
-static cl_kernel  g_kern;
+static cl_kernel  g_kern, g_kern8, g_kern_tail;
 static struct s10ga_entry g_tab[S10GA_TABLE];
 static size_t     g_gpu_bytes;
 static int        g_ntensors;
@@ -99,7 +96,7 @@ static int s10ga_init(void) {
     if (getenv("GGML_S10_GPU_WAIT") && !strcmp(getenv("GGML_S10_GPU_WAIT"), "read")) g_spin = 0;
     if (getenv("GGML_S10_GPU_SLOTS")) {
         g_slots = atoi(getenv("GGML_S10_GPU_SLOTS"));
-        if (g_slots < 1 || g_slots > 16) g_slots = 2;
+        if (g_slots < 1 || g_slots > 4) g_slots = 0;
     }
     g_min_bytes = getenv("GGML_S10_GPU_MINMB") ? atof(getenv("GGML_S10_GPU_MINMB")) * 1048576.0 : 0.0;
     g_fuse  = !(getenv("GGML_S10_GPU_FUSE") && atoi(getenv("GGML_S10_GPU_FUSE")) == 0);
@@ -150,8 +147,18 @@ static int s10ga_init_cl(void) {
         return 0;
     }
     g_kern = clCreateKernel(prog, "s10ga_ptq1_mv", &err);
+    if (err == CL_SUCCESS) {
+        g_kern8 = clCreateKernel(prog, "s10ga_ptq1_mv8", &err);
+    }
+    if (err == CL_SUCCESS) {
+        g_kern_tail = clCreateKernel(prog, "s10ga_ptq1_mv_tail", &err);
+    }
     clReleaseProgram(prog);
-    if (err != CL_SUCCESS) { return 0; }
+    if (err != CL_SUCCESS) {
+        if (g_kern) { clReleaseKernel(g_kern); g_kern = NULL; }
+        if (g_kern8) { clReleaseKernel(g_kern8); g_kern8 = NULL; }
+        return 0;
+    }
 
     char name[256] = {0};
     clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(name) - 1, name, NULL);
@@ -289,32 +296,42 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
     cl_int err;
     const int64_t R = e->rows;
     const int nbi = (int) nb, Ri = (int) R, lanes = S10GA_LANES;
-    clSetKernelArg(g_kern, 0, sizeof(cl_mem), &e->w);
-    clSetKernelArg(g_kern, 1, sizeof(cl_mem), &g_bdx);   // unused fp32 activations
-    clSetKernelArg(g_kern, 2, sizeof(cl_mem), &g_bqx);
-    clSetKernelArg(g_kern, 3, sizeof(cl_mem), &g_bdx);
-    clSetKernelArg(g_kern, 4, sizeof(cl_mem), &out);
-    clSetKernelArg(g_kern, 5, sizeof(int), &nbi);
-    clSetKernelArg(g_kern, 6, sizeof(int), &Ri);
-    clSetKernelArg(g_kern, 7, sizeof(int), &lanes);
-    clSetKernelArg(g_kern, 8, S10GA_WG * 4 * sizeof(float), NULL);
-    clSetKernelArg(g_kern, 11, sizeof(cl_mem), &g_bas);
+    // Long K with many rows favors four rows per item. Other measured shares favor eight.
+    // Keep the final block batch uniform and bound every load on this Mesa path.
+    const int tail = nb % 4 != 0;
+    const int tile = tail || (nb >= 128 && R >= 4096) ? 4 : 8;
+    int slots = g_slots ? g_slots : (tile == 4 ? 2 : (R >= 4096 ? 4 : 1));
+    // A user override or an unaligned share must still cover every cached row.
+    if (R % (tile * slots) != 0) slots = 1;
+    const int tile_rows = tile * slots, wg = lanes * slots;
+    cl_kernel kernel = tail ? g_kern_tail : (tile == 4 ? g_kern : g_kern8);
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), &e->w);
+    clSetKernelArg(kernel, 1, sizeof(cl_mem), &g_bdx);   // unused fp32 activations
+    clSetKernelArg(kernel, 2, sizeof(cl_mem), &g_bqx);
+    clSetKernelArg(kernel, 3, sizeof(cl_mem), &g_bdx);
+    clSetKernelArg(kernel, 4, sizeof(cl_mem), &out);
+    clSetKernelArg(kernel, 5, sizeof(int), &nbi);
+    clSetKernelArg(kernel, 6, sizeof(int), &Ri);
+    clSetKernelArg(kernel, 7, sizeof(int), &lanes);
+    clSetKernelArg(kernel, 8, wg * tile * sizeof(float), NULL);
+    clSetKernelArg(kernel, 11, sizeof(cl_mem), &g_bas);
 
     // each dispatch covers at most S10GA_MAX_ROWS rows x columns
-    const int64_t rows_per = R < S10GA_MAX_ROWS ? R : S10GA_MAX_ROWS;
+    const int64_t row_limit = S10GA_MAX_ROWS / tile_rows * tile_rows;
+    const int64_t rows_per = R < row_limit ? R : row_limit;
     int64_t cols_per = S10GA_MAX_ROWS / rows_per;
     if (cols_per < 1) cols_per = 1;
     for (int64_t c0 = 0; c0 < ncols; c0 += cols_per) {
         const int64_t nc = ncols - c0 < cols_per ? ncols - c0 : cols_per;
         for (int64_t r0 = 0; r0 < R; r0 += rows_per) {
             const int64_t nr = R - r0 < rows_per ? R - r0 : rows_per;
-            const int group_base = (int) (r0 / S10GA_TILE_ROWS), col_base = (int) c0;
-            clSetKernelArg(g_kern, 9, sizeof(int), &group_base);
-            clSetKernelArg(g_kern, 10, sizeof(int), &col_base);
-            const size_t global[2] = { (size_t) (nr / S10GA_TILE_ROWS) * S10GA_WG, (size_t) nc };
-            const size_t local[2]  = { S10GA_WG, 1 };
+            const int group_base = (int) (r0 / tile_rows), col_base = (int) c0;
+            clSetKernelArg(kernel, 9, sizeof(int), &group_base);
+            clSetKernelArg(kernel, 10, sizeof(int), &col_base);
+            const size_t global[2] = { (size_t) (nr / tile_rows) * wg, (size_t) nc };
+            const size_t local[2]  = { wg, 1 };
             if (*kev) { clReleaseEvent(*kev); *kev = NULL; }
-            err = clEnqueueNDRangeKernel(g_q, g_kern, 2, NULL, global, local, 0, NULL, kev);
+            err = clEnqueueNDRangeKernel(g_q, kernel, 2, NULL, global, local, 0, NULL, kev);
             if (err != CL_SUCCESS) {
                 GGML_LOG_ERROR("s10-gpu-assist: enqueue failed (%d)\n", err);
                 GGML_ABORT("s10-gpu-assist");
