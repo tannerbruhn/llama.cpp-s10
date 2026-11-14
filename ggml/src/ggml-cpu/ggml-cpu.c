@@ -1260,20 +1260,23 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
 #if defined(__aarch64__)
     // S10: two-row PTQ1_0 kernel (GGML_PTQ1_X2=0 turns it off) with software prefetch on every core
-    // (in the 27B, without prefetch: 0.68 tok/s, with: 0.80). GGML_PTQ1_X2_PF=0 turns prefetch off,
+    // (in the 27B, without prefetch: 0.68 tok/s, 768 B ahead: 0.80, the next row pair: 0.86).
+    // GGML_PTQ1_X2_PFD sets the distance: bytes if > 0, -N for N row pairs ahead. GGML_PTQ1_X2_PF=0 turns prefetch off,
     // 2 enables it only on the A75s (CPUs 4-5), which is what the isolated microbench preferred.
-    static int s10_x2_mode = -1, s10_x2_pf_mode = -1;
+    static int s10_x2_mode = -1, s10_x2_pf_mode = -1, s10_x2_pf_dist = -1;
     if (s10_x2_mode < 0) {
         const char * e = getenv("GGML_PTQ1_X2");
         const char * p = getenv("GGML_PTQ1_X2_PF");
         s10_x2_pf_mode = p ? atoi(p) : 1;
+        const char * d = getenv("GGML_PTQ1_X2_PFD"); // prefetch distance in bytes
+        if (d && atoi(d) != 0) { s10_x2_pf_dist = atoi(d); } // -N: N row pairs ahead (default -1: the next pair)
         s10_x2_mode = e ? atoi(e) != 0 : 1;
     }
     const bool s10_x2 = s10_x2_mode && type == GGML_TYPE_PTQ1_0;
     size_t s10_x2_pf = 0;
     if (s10_x2) {
         const int pf = s10_x2_pf_mode == 2 ? (sched_getcpu() < 6) : s10_x2_pf_mode;
-        s10_x2_pf = pf ? 768 : 0;
+        s10_x2_pf = pf ? (s10_x2_pf_dist < 0 ? (size_t) (-s10_x2_pf_dist) * 2 * nb01 : (size_t) s10_x2_pf_dist) : 0;
     }
 #endif
 
