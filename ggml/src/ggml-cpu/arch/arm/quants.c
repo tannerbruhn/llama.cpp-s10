@@ -1818,6 +1818,76 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+// S10: two PTQ1_0 rows against one Q8_0 column. The rows share every activation load and
+// scale conversion (+10% on the M4, +13% on the A75 with prefetch, microbench 2026-11-14).
+// Three or more rows spill registers with GCC and are slower.
+void ggml_vec_dot_ptq1_0_q8_0_x2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t prefetch) {
+#if GGML_PTQ1_LEAN2 && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+    static const uint8_t idx01[16] = {4,5,6,7,8,9,10,11,4,5,6,7,8,9,10,11};
+    static const uint8_t pow01[16] = {1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3};
+    static const uint8_t idx4h[16] = {4,5,6,7,8,9,10,11,12,13,12,13,12,13,12,13};
+    static const uint8_t pow4h[16] = {81,81,81,81,81,81,81,81,1,1,3,3,9,9,27,27};
+    const int nb = n / QK_PTQ1_0;
+    const block_ptq1_0 * GGML_RESTRICT x0 = vx;
+    const block_ptq1_0 * GGML_RESTRICT x1 = (const block_ptq1_0 *) ((const uint8_t *) vx + bx);
+    const block_q8_0   * GGML_RESTRICT y  = vy;
+    float32x4_t sum0 = vdupq_n_f32(0.0f), sum1 = vdupq_n_f32(0.0f);
+#define PTQ1_X2_TRIT(v) vreinterpretq_s8_u8(vsubq_u8(vcltq_u8((v), vdupq_n_u8(86)), vcgtq_u8((v), vdupq_n_u8(170))))
+#define PTQ1_X2_LO(xb, P) do { \
+        if (prefetch) { __builtin_prefetch((const uint8_t *) (xb) + prefetch, 0, 3); } \
+        const uint8x16_t a = vld1q_u8((xb)->qs); \
+        int32x4_t q0 = vdotq_s32(vdupq_n_s32(0), PTQ1_X2_TRIT(a), y0); \
+        q0 = vdotq_s32(q0, PTQ1_X2_TRIT(vmulq_u8(a, vdupq_n_u8(3))), y1); \
+        int32x4_t q1 = vdotq_s32(vdupq_n_s32(0), PTQ1_X2_TRIT(vmulq_u8(a, vdupq_n_u8(9))), y2); \
+        q1 = vdotq_s32(q1, PTQ1_X2_TRIT(vmulq_u8(a, vdupq_n_u8(27))), y3); \
+        P = vpaddq_s32(q0, q1); } while (0)
+#define PTQ1_X2_HI(xb, P) do { \
+        const uint8x16_t a = vld1q_u8((xb)->qs); \
+        const uint8x16_t tail = vld1q_u8((const uint8_t *) (const void *) (xb) + 12); \
+        const uint8x16_t t = vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx01)), vld1q_u8(pow01)); \
+        int32x4_t q2 = vdotq_s32(vdupq_n_s32(0), PTQ1_X2_TRIT(vmulq_u8(a, vdupq_n_u8(81))), y4); \
+        q2 = vdotq_s32(q2, PTQ1_X2_TRIT(t), y5); \
+        int32x4_t q3 = vdotq_s32(vdupq_n_s32(0), PTQ1_X2_TRIT(vmulq_u8(t, vdupq_n_u8(9))), y6); \
+        q3 = vdotq_s32(q3, PTQ1_X2_TRIT(vmulq_u8(vqtbl1q_u8(tail, vld1q_u8(idx4h)), vld1q_u8(pow4h))), y7); \
+        P = vpaddq_s32(q2, q3); } while (0)
+#pragma GCC unroll 1
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_0 * yb = &y[4*i];
+        uint16x4_t dh = vdup_n_u16(yb[0].d);
+        dh = vld1_lane_u16(&yb[1].d, dh, 1);
+        dh = vld1_lane_u16(&yb[2].d, dh, 2);
+        dh = vld1_lane_u16(&yb[3].d, dh, 3);
+        const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(dh));
+        int32x4_t pa0, pa1, pb0, pb1;
+        {
+            const int8x16_t y0 = vld1q_s8(yb[0].qs), y1 = vld1q_s8(yb[0].qs + 16);
+            const int8x16_t y2 = vld1q_s8(yb[1].qs), y3 = vld1q_s8(yb[1].qs + 16);
+            PTQ1_X2_LO(&x0[i], pa0);
+            PTQ1_X2_LO(&x1[i], pa1);
+        }
+        {
+            const int8x16_t y4 = vld1q_s8(yb[2].qs), y5 = vld1q_s8(yb[2].qs + 16);
+            const int8x16_t y6 = vld1q_s8(yb[3].qs), y7 = vld1q_s8(yb[3].qs + 16);
+            PTQ1_X2_HI(&x0[i], pb0);
+            PTQ1_X2_HI(&x1[i], pb1);
+        }
+        const float dx0 = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(x0[i].d)), 0);
+        const float dx1 = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(x1[i].d)), 0);
+        sum0 = vfmaq_f32(sum0, vcvtq_f32_s32(vpaddq_s32(pa0, pb0)), vmulq_n_f32(dy, dx0));
+        sum1 = vfmaq_f32(sum1, vcvtq_f32_s32(vpaddq_s32(pa1, pb1)), vmulq_n_f32(dy, dx1));
+    }
+#undef PTQ1_X2_LO
+#undef PTQ1_X2_HI
+#undef PTQ1_X2_TRIT
+    s[0] = vaddvq_f32(sum0);
+    s[1] = vaddvq_f32(sum1);
+#else
+    GGML_UNUSED(prefetch);
+    ggml_vec_dot_ptq1_0_q8_0(n, s,     0, vx,                               0, vy, 0, 1);
+    ggml_vec_dot_ptq1_0_q8_0(n, s + 1, 0, (const uint8_t *) vx + bx, 0, vy, 0, 1);
+#endif
+}
+
 void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
