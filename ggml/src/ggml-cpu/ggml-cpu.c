@@ -1280,9 +1280,37 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 #endif
 
+#if defined(__aarch64__)
+    // S10: prompts decode each PTQ1_0 row once for four columns (GGML_PTQ1_C4=0 turns it off).
+    static int s10_c4_mode = -1;
+    if (s10_c4_mode < 0) {
+        const char * e = getenv("GGML_PTQ1_C4");
+        s10_c4_mode = e ? atoi(e) != 0 : 1;
+    }
+    const bool s10_c4 = s10_x2 && s10_c4_mode && num_rows_per_vec_dot == 1 && ne12 == 1 && ne13 == 1 &&
+                        (src1_cont || src1->type != vec_dot_type);
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+            int64_t ir1_first = iir1;
+#if defined(__aarch64__)
+            if (s10_c4) {
+                const int64_t end1 = MIN(iir1 + blck_1, ir1_end);
+                const int64_t end0 = MIN(iir0 + blck_0, ir0_end);
+                for (; ir1_first + 3 < end1; ir1_first += 4) {
+                    const char * y4 = (const char *) wdata + ir1_first * row_size;
+                    for (int64_t ir0 = iir0; ir0 < end0; ++ir0) {
+                        float r4[4];
+                        ggml_vec_dot_ptq1_0_q8_0_c4(ne00, r4, (const char *) src0->data + ir0 * nb01, y4, row_size, s10_x2_pf);
+                        for (int c = 0; c < 4; ++c) {
+                            ((float *) ((char *) dst->data + (ir1_first + c) * nb1))[ir0] = r4[c];
+                        }
+                    }
+                }
+            }
+#endif
+            for (int64_t ir1 = ir1_first; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
                 const int64_t i13 = (ir1 / (ne12 * ne1));
                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
                 const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);

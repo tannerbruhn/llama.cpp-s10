@@ -12,6 +12,7 @@
 
 #include "s10-gpu-assist.h"
 #include "s10-gpu-assist-kernel.h"
+#include "s10-gpu-assist-mm4.h"
 #include "ggml-impl.h"
 
 #include <math.h>
@@ -63,7 +64,7 @@ static float s10ga_frac_for(const char * name) {
 static double     g_min_bytes;   // GGML_S10_GPU_MINMB: only tensors at least this big (MiB) get GPU rows
 static cl_context g_ctx;
 static cl_command_queue g_q;
-static cl_kernel  g_kern, g_kern8, g_kern_tail;
+static cl_kernel  g_kern, g_kern8, g_kern_tail, g_kern_mm4; // mm4: prompt kernel, 4 rows x 4 columns per item
 static struct s10ga_entry g_tab[S10GA_TABLE];
 static size_t     g_gpu_bytes;
 static int        g_ntensors;
@@ -147,7 +148,8 @@ static int s10ga_init_cl(void) {
     g_q = clCreateCommandQueueWithProperties(g_ctx, dev, getenv("GGML_S10_GPU_PROF") ? qprops : NULL, &err);
     if (err != CL_SUCCESS) { return 0; }
 
-    cl_program prog = clCreateProgramWithSource(g_ctx, 1, &s10ga_kernel_src, NULL, &err);
+    const char * srcs[2] = { s10ga_kernel_src, s10ga_kernel_mm4_src };
+    cl_program prog = clCreateProgramWithSource(g_ctx, 2, srcs, NULL, &err);
     if (err != CL_SUCCESS) { return 0; }
     err = clBuildProgram(prog, 1, &dev, "-cl-std=CL3.0", NULL, NULL);
     if (err != CL_SUCCESS) {
@@ -162,6 +164,11 @@ static int s10ga_init_cl(void) {
     }
     if (err == CL_SUCCESS) {
         g_kern_tail = clCreateKernel(prog, "s10ga_ptq1_mv_tail", &err);
+    }
+    if (err == CL_SUCCESS && !(getenv("GGML_S10_GPU_MM4") && atoi(getenv("GGML_S10_GPU_MM4")) == 0)) {
+        cl_int e4;
+        g_kern_mm4 = clCreateKernel(prog, "s10ga_ptq1_mm4", &e4);   // optional; prompts fall back to mv
+        if (e4 != CL_SUCCESS) { g_kern_mm4 = NULL; }
     }
     clReleaseProgram(prog);
     if (err != CL_SUCCESS) {
@@ -314,6 +321,49 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
     // A user override or an unaligned share must still cover every cached row.
     if (R % (tile * slots) != 0) slots = 1;
     const int tile_rows = tile * slots, wg = lanes * slots;
+    // Prompts (4+ columns, no K tail): the mm4 kernel loads each weight word once for 4 columns.
+    int64_t col0 = 0;
+    if (g_kern_mm4 && !tail && ncols >= 4) {
+        const int s4 = (R % 8 == 0) ? 2 : 1;                     // rows are 4-aligned; two row slots when possible
+        const int tr4 = 4 * s4, wg4 = lanes * s4;
+        cl_kernel k4 = g_kern_mm4;
+        clSetKernelArg(k4, 0, sizeof(cl_mem), &e->w);
+        clSetKernelArg(k4, 1, sizeof(cl_mem), &g_bdx);
+        clSetKernelArg(k4, 2, sizeof(cl_mem), &g_bqx);
+        clSetKernelArg(k4, 3, sizeof(cl_mem), &g_bdx);
+        clSetKernelArg(k4, 4, sizeof(cl_mem), &out);
+        clSetKernelArg(k4, 5, sizeof(int), &nbi);
+        clSetKernelArg(k4, 6, sizeof(int), &Ri);
+        clSetKernelArg(k4, 7, sizeof(int), &lanes);
+        clSetKernelArg(k4, 8, wg4 * 16 * sizeof(float), NULL);
+        clSetKernelArg(k4, 11, sizeof(cl_mem), &g_bas);
+        const int64_t rl4 = S10GA_MAX_ROWS / 4 / tr4 * tr4;      // a quad does 4x the work of one column
+        const int64_t rp4 = R < rl4 ? R : (rl4 > 0 ? rl4 : tr4);
+        int64_t qp4 = S10GA_MAX_ROWS / 4 / rp4;
+        if (qp4 < 1) qp4 = 1;
+        const int64_t nq = ncols / 4;
+        for (int64_t q0 = 0; q0 < nq; q0 += qp4) {
+            const int64_t nqq = nq - q0 < qp4 ? nq - q0 : qp4;
+            for (int64_t r0 = 0; r0 < R; r0 += rp4) {
+                const int64_t nr = R - r0 < rp4 ? R - r0 : rp4;
+                const int group_base = (int) (r0 / tr4), col_base = (int) (q0 * 4);
+                clSetKernelArg(k4, 9, sizeof(int), &group_base);
+                clSetKernelArg(k4, 10, sizeof(int), &col_base);
+                const size_t global[2] = { (size_t) (nr / tr4) * wg4, (size_t) nqq };
+                const size_t local[2]  = { wg4, 1 };
+                if (*kev) { clReleaseEvent(*kev); *kev = NULL; }
+                err = clEnqueueNDRangeKernel(g_q, k4, 2, NULL, global, local, 0, NULL, kev);
+                if (err != CL_SUCCESS) {
+                    GGML_LOG_ERROR("s10-gpu-assist: mm4 enqueue failed (%d)\n", err);
+                    GGML_ABORT("s10-gpu-assist");
+                }
+            }
+        }
+        col0 = nq * 4;
+        if (col0 == ncols) {
+            return;
+        }
+    }
     cl_kernel kernel = tail ? g_kern_tail : (tile == 4 ? g_kern : g_kern8);
     clSetKernelArg(kernel, 0, sizeof(cl_mem), &e->w);
     clSetKernelArg(kernel, 1, sizeof(cl_mem), &g_bdx);   // unused fp32 activations
@@ -331,7 +381,7 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
     const int64_t rows_per = R < row_limit ? R : row_limit;
     int64_t cols_per = S10GA_MAX_ROWS / rows_per;
     if (cols_per < 1) cols_per = 1;
-    for (int64_t c0 = 0; c0 < ncols; c0 += cols_per) {
+    for (int64_t c0 = col0; c0 < ncols; c0 += cols_per) {
         const int64_t nc = ncols - c0 < cols_per ? ncols - c0 : cols_per;
         for (int64_t r0 = 0; r0 < R; r0 += rows_per) {
             const int64_t nr = R - r0 < rows_per ? R - r0 : rows_per;

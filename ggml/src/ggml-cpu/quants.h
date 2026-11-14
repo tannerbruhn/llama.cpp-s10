@@ -48,6 +48,8 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #if defined(__aarch64__)
 // S10: two consecutive PTQ1_0 rows (stride bx) against one Q8_0 column; s[0], s[1].
 void ggml_vec_dot_ptq1_0_q8_0_x2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t prefetch);
+// S10: one PTQ1_0 row against four Q8_0 columns (column stride by bytes); s[0..3].
+void ggml_vec_dot_ptq1_0_q8_0_c4(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, size_t prefetch);
 #endif
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
