@@ -249,7 +249,64 @@ void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const block_q4_0x4 * b_ptr = (const block_q4_0x4 *) vx;
 
-    for (int c = 0; c < nc; c += ncols_interleaved) {
+    // S10: two column groups (8 rows) per pass share the activation loads and scale conversion,
+    // and the low/high nibble dots run as two independent chains. Integer sums and the float
+    // accumulation order per row are unchanged, so results are bit-identical.
+    int c = 0;
+    for (; c + 2*ncols_interleaved <= nc; c += 2*ncols_interleaved) {
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        const block_q4_0x4 * g0 = b_ptr;
+        const block_q4_0x4 * g1 = b_ptr + nb;
+        float32x4_t acc0 = vdupq_n_f32(0);
+        float32x4_t acc1 = vdupq_n_f32(0);
+        for (int b = 0; b < nb; b++) {
+            const int8x16_t a0 = vld1q_s8(a_ptr->qs);
+            const int8x16_t a1 = vld1q_s8(a_ptr->qs + qk/2);
+            const float32x4_t ad = vcvt_f32_f16(vld1_dup_f16((const __fp16 *) &a_ptr->d));
+
+            const int8x16_t x0 = vld1q_s8((const int8_t *) g0->qs);
+            const int8x16_t x1 = vld1q_s8((const int8_t *) g0->qs + 16);
+            const int8x16_t x2 = vld1q_s8((const int8_t *) g0->qs + 32);
+            const int8x16_t x3 = vld1q_s8((const int8_t *) g0->qs + 48);
+            const int8x16_t y0 = vld1q_s8((const int8_t *) g1->qs);
+            const int8x16_t y1 = vld1q_s8((const int8_t *) g1->qs + 16);
+            const int8x16_t y2 = vld1q_s8((const int8_t *) g1->qs + 32);
+            const int8x16_t y3 = vld1q_s8((const int8_t *) g1->qs + 48);
+
+            int32x4_t lo0 = vdupq_n_s32(0), hi0 = vdupq_n_s32(0);
+            int32x4_t lo1 = vdupq_n_s32(0), hi1 = vdupq_n_s32(0);
+            lo0 = vdotq_laneq_s32(lo0, x0 << 4, a0, 0);
+            lo1 = vdotq_laneq_s32(lo1, y0 << 4, a0, 0);
+            hi0 = vdotq_laneq_s32(hi0, x0 & 0xf0U, a1, 0);
+            hi1 = vdotq_laneq_s32(hi1, y0 & 0xf0U, a1, 0);
+            lo0 = vdotq_laneq_s32(lo0, x1 << 4, a0, 1);
+            lo1 = vdotq_laneq_s32(lo1, y1 << 4, a0, 1);
+            hi0 = vdotq_laneq_s32(hi0, x1 & 0xf0U, a1, 1);
+            hi1 = vdotq_laneq_s32(hi1, y1 & 0xf0U, a1, 1);
+            lo0 = vdotq_laneq_s32(lo0, x2 << 4, a0, 2);
+            lo1 = vdotq_laneq_s32(lo1, y2 << 4, a0, 2);
+            hi0 = vdotq_laneq_s32(hi0, x2 & 0xf0U, a1, 2);
+            hi1 = vdotq_laneq_s32(hi1, y2 & 0xf0U, a1, 2);
+            lo0 = vdotq_laneq_s32(lo0, x3 << 4, a0, 3);
+            lo1 = vdotq_laneq_s32(lo1, y3 << 4, a0, 3);
+            hi0 = vdotq_laneq_s32(hi0, x3 & 0xf0U, a1, 3);
+            hi1 = vdotq_laneq_s32(hi1, y3 & 0xf0U, a1, 3);
+
+            const float32x4_t d0 = vmulq_f32(ad, vcvt_f32_f16(vld1_f16((const __fp16 *) g0->d)));
+            const float32x4_t d1 = vmulq_f32(ad, vcvt_f32_f16(vld1_f16((const __fp16 *) g1->d)));
+            acc0 = vfmaq_f32(acc0, vcvtq_n_f32_s32(vaddq_s32(lo0, hi0), 4), d0);
+            acc1 = vfmaq_f32(acc1, vcvtq_n_f32_s32(vaddq_s32(lo1, hi1), 4), d1);
+            a_ptr++;
+            g0++;
+            g1++;
+        }
+        vst1q_f32(s, acc0);
+        vst1q_f32(s + ncols_interleaved, acc1);
+        s += 2*ncols_interleaved;
+        b_ptr += 2*nb;
+    }
+
+    for (; c < nc; c += ncols_interleaved) {
         const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
         float32x4_t acc = vdupq_n_f32(0);
         for (int b = 0; b < nb; b++) {
