@@ -53,6 +53,13 @@ static long    g_n_used, g_n_dropped, g_n_queued;
 static int        g_state = -1;   // -1 not initialized, 0 off, 1 on
 static float      g_frac;
 static int        g_check;
+// per-shape shares (default: GGML_S10_GPU_FRAC): GGML_S10_GPU_FRAC_UPGATE, _DOWN, _OTHER
+static float      g_frac_upgate = -1, g_frac_down = -1, g_frac_other = -1;
+static float s10ga_frac_for(const char * name) {
+    if (strstr(name, "ffn_down")) return g_frac_down >= 0 ? g_frac_down : g_frac;
+    if (strstr(name, "ffn_gate") || strstr(name, "ffn_up")) return g_frac_upgate >= 0 ? g_frac_upgate : g_frac;
+    return g_frac_other >= 0 ? g_frac_other : g_frac;
+}
 static double     g_min_bytes;   // GGML_S10_GPU_MINMB: only tensors at least this big (MiB) get GPU rows
 static cl_context g_ctx;
 static cl_command_queue g_q;
@@ -90,6 +97,9 @@ static int s10ga_init(void) {
     const char * s = getenv("GGML_S10_GPU_FRAC");
     g_frac  = s ? (float) atof(s) : 0.0f;
     g_check = getenv("GGML_S10_GPU_CHECK") != NULL;
+    if (getenv("GGML_S10_GPU_FRAC_UPGATE")) g_frac_upgate = (float) atof(getenv("GGML_S10_GPU_FRAC_UPGATE"));
+    if (getenv("GGML_S10_GPU_FRAC_DOWN"))   g_frac_down   = (float) atof(getenv("GGML_S10_GPU_FRAC_DOWN"));
+    if (getenv("GGML_S10_GPU_FRAC_OTHER"))  g_frac_other  = (float) atof(getenv("GGML_S10_GPU_FRAC_OTHER"));
     g_prof  = getenv("GGML_S10_GPU_PROF") != NULL;
     g_hprof = getenv("GGML_S10_GPU_HPROF") != NULL;
     g_fake  = getenv("GGML_S10_GPU_FAKE") != NULL;
@@ -208,7 +218,7 @@ static struct s10ga_entry * s10ga_lookup(const struct ggml_tensor * src0) {
             e->partner = NULL;
             snprintf(e->name, sizeof(e->name), "%s", src0->name);
             const int64_t K = src0->ne[0], M = src0->ne[1], nb = K / 128;
-            const int64_t rows = ((int64_t) (M * g_frac)) / S10GA_TILE_ROWS * S10GA_TILE_ROWS;
+            const int64_t rows = ((int64_t) (M * s10ga_frac_for(src0->name))) / S10GA_TILE_ROWS * S10GA_TILE_ROWS;
             if (rows < S10GA_TILE_ROWS || (double) ggml_nbytes(src0) < g_min_bytes) {
                 return e;
             }

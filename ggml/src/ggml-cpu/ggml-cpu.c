@@ -3186,6 +3186,39 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// GGML_S10_OPPROF: thread 0 accumulates the wall time of each node (compute + barrier) by op kind and prints a
+// per-graph average every 32 graphs.
+#define S10P_MAX 48
+static struct { char key[48]; double t; long n; } s10p_tab[S10P_MAX];
+static int s10p_n, s10p_on = -1; static long s10p_graphs;
+static double s10p_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
+static void s10p_add(const char * key, double dt) {
+    for (int i = 0; i < s10p_n; i++) if (!strcmp(s10p_tab[i].key, key)) { s10p_tab[i].t += dt; s10p_tab[i].n++; return; }
+    if (s10p_n < S10P_MAX) { snprintf(s10p_tab[s10p_n].key, 48, "%s", key); s10p_tab[s10p_n].t = dt; s10p_tab[s10p_n].n = 1; s10p_n++; }
+}
+static void s10p_key(const struct ggml_tensor * node, int fused, char * key) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const struct ggml_tensor * w = node->src[0];
+        snprintf(key, 48, "%s%s %s %s n%lld", fused ? "fused " : "", ggml_op_desc(node), ggml_type_name(w->type),
+                 ggml_nbytes(w) >= 6u << 20 ? ">=6MB" : "<6MB", (long long) node->src[1]->ne[1]);
+    } else {
+        snprintf(key, 48, "%s%s", fused ? "fused " : "", ggml_op_desc(node));
+    }
+}
+static void s10p_report(void) {
+    if (++s10p_graphs % 32) return;
+    double tot = 0; for (int i = 0; i < s10p_n; i++) tot += s10p_tab[i].t;
+    fprintf(stderr, "s10-opprof window: %ld graphs, %.1f ms/graph\n", s10p_graphs, tot / s10p_graphs * 1e3);
+    for (int k = 0; k < s10p_n; k++) {   // sorted print, largest first
+        int best = -1; for (int i = 0; i < s10p_n; i++) if (s10p_tab[i].n >= 0 && (best < 0 || s10p_tab[i].t > s10p_tab[best].t)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "  %-44s %8.2f ms/graph %6.1f%% %6.1f calls/graph\n", s10p_tab[best].key, s10p_tab[best].t / s10p_graphs * 1e3,
+                100 * s10p_tab[best].t / tot, (double) s10p_tab[best].n / s10p_graphs);
+        s10p_tab[best].n = -1 - s10p_tab[best].n;   // mark printed
+    }
+    s10p_n = 0; s10p_graphs = 0;   // next report covers the next window only
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3226,6 +3259,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (s10p_on < 0) s10p_on = getenv("GGML_S10_OPPROF") != NULL;
+        const double s10p_t0 = (s10p_on && state->ith == 0) ? s10p_now() : 0.0;
+        const int s10p_node = node_n;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3244,6 +3281,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+        if (s10p_on && state->ith == 0) {
+            char key[48];
+            s10p_key(cgraph->nodes[s10p_node], n_fused > 0, key);
+            s10p_add(key, s10p_now() - s10p_t0);
+        }
+    }
+    if (s10p_on && state->ith == 0) {
+        s10p_report();
     }
 
 #ifdef GGML_USE_OPENMP
