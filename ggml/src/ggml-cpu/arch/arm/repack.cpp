@@ -573,6 +573,64 @@ void ggml_gemv_iq4_nl_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
     ggml_gemv_iq4_nl_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+// S10: two activation rows (tokens) against IQ4_NL 4x4-interleaved weights. Each weight block is loaded and
+// table-decoded once and dotted with both rows, so a 2-token batch reads the weights once instead of twice
+// (verification batches for speculative decoding, small prompt tails). Results match two gemv calls exactly
+// (same integer dots, same per-block float order).
+void ggml_gemv2_iq4_nl_4x4_q8_0(int n, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1, const void * GGML_RESTRICT vx,
+                                const void * GGML_RESTRICT vy0, const void * GGML_RESTRICT vy1, int nc) {
+    const int nb = n / QK8_0;
+    const int8x16_t kvalues = vld1q_s8(kvalues_iq4nl);
+    const block_q8_0 * a0 = (const block_q8_0 *) vy0;
+    const block_q8_0 * a1 = (const block_q8_0 *) vy1;
+
+    for (int x = 0; x < nc / 4; x++) {
+        const block_iq4_nlx4 * b_ptr = (const block_iq4_nlx4 *) vx + (x * nb);
+        float32x4_t sumf0 = vdupq_n_f32(0);
+        float32x4_t sumf1 = vdupq_n_f32(0);
+        for (int l = 0; l < nb; l++) {
+            const uint8x16_t b_0 = vld1q_u8(b_ptr[l].qs + 0);
+            const uint8x16_t b_1 = vld1q_u8(b_ptr[l].qs + 16);
+            const uint8x16_t b_2 = vld1q_u8(b_ptr[l].qs + 32);
+            const uint8x16_t b_3 = vld1q_u8(b_ptr[l].qs + 48);
+            const int8x16_t b_0_hi = vqtbl1q_s8(kvalues, b_0 >> 4);
+            const int8x16_t b_0_lo = vqtbl1q_s8(kvalues, b_0 & 0x0F);
+            const int8x16_t b_1_hi = vqtbl1q_s8(kvalues, b_1 >> 4);
+            const int8x16_t b_1_lo = vqtbl1q_s8(kvalues, b_1 & 0x0F);
+            const int8x16_t b_2_hi = vqtbl1q_s8(kvalues, b_2 >> 4);
+            const int8x16_t b_2_lo = vqtbl1q_s8(kvalues, b_2 & 0x0F);
+            const int8x16_t b_3_hi = vqtbl1q_s8(kvalues, b_3 >> 4);
+            const int8x16_t b_3_lo = vqtbl1q_s8(kvalues, b_3 & 0x0F);
+            const float32x4_t b_d = vcvt_f32_f16(vld1_f16((const float16_t *) b_ptr[l].d));
+
+            const int8x16_t x0_0 = vld1q_s8(a0[l].qs + 0);
+            const int8x16_t x0_1 = vld1q_s8(a0[l].qs + 16);
+            const int8x16_t x1_0 = vld1q_s8(a1[l].qs + 0);
+            const int8x16_t x1_1 = vld1q_s8(a1[l].qs + 16);
+
+            int32x4_t sumi0 = vdupq_n_s32(0);
+            int32x4_t sumi1 = vdupq_n_s32(0);
+            sumi0 = vdotq_laneq_s32(sumi0, b_0_lo, x0_0, 0);  sumi1 = vdotq_laneq_s32(sumi1, b_0_lo, x1_0, 0);
+            sumi0 = vdotq_laneq_s32(sumi0, b_0_hi, x0_1, 0);  sumi1 = vdotq_laneq_s32(sumi1, b_0_hi, x1_1, 0);
+            sumi0 = vdotq_laneq_s32(sumi0, b_1_lo, x0_0, 1);  sumi1 = vdotq_laneq_s32(sumi1, b_1_lo, x1_0, 1);
+            sumi0 = vdotq_laneq_s32(sumi0, b_1_hi, x0_1, 1);  sumi1 = vdotq_laneq_s32(sumi1, b_1_hi, x1_1, 1);
+            sumi0 = vdotq_laneq_s32(sumi0, b_2_lo, x0_0, 2);  sumi1 = vdotq_laneq_s32(sumi1, b_2_lo, x1_0, 2);
+            sumi0 = vdotq_laneq_s32(sumi0, b_2_hi, x0_1, 2);  sumi1 = vdotq_laneq_s32(sumi1, b_2_hi, x1_1, 2);
+            sumi0 = vdotq_laneq_s32(sumi0, b_3_lo, x0_0, 3);  sumi1 = vdotq_laneq_s32(sumi1, b_3_lo, x1_0, 3);
+            sumi0 = vdotq_laneq_s32(sumi0, b_3_hi, x0_1, 3);  sumi1 = vdotq_laneq_s32(sumi1, b_3_hi, x1_1, 3);
+
+            const float32x4_t d0 = vcvt_f32_f16(vld1_dup_f16((const float16_t *) &a0[l].d)) * b_d;
+            const float32x4_t d1 = vcvt_f32_f16(vld1_dup_f16((const float16_t *) &a1[l].d)) * b_d;
+            sumf0 = vmlaq_f32(sumf0, d0, vcvtq_f32_s32(sumi0));
+            sumf1 = vmlaq_f32(sumf1, d1, vcvtq_f32_s32(sumi1));
+        }
+        vst1q_f32(s0 + x * 4, sumf0);
+        vst1q_f32(s1 + x * 4, sumf1);
+    }
+}
+#endif
+
 void ggml_gemv_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK8_0;
     const int nb = n / qk;

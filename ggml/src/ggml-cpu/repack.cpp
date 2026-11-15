@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 
@@ -4693,6 +4694,21 @@ template <> void gemv<block_q6_K, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t
     ggml_gemv_q6_K_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
 
+// S10: two-token gemv (one pass over the weights for 2 activation rows). Returns false when the type has no
+// such kernel; the caller then runs gemv per row. Enabled with GGML_S10_GEMV2=1 (default off until measured).
+static bool s10_gemv2_enabled() {
+    static const bool on = getenv("GGML_S10_GEMV2") != nullptr && atoi(getenv("GGML_S10_GEMV2")) != 0;
+    return on;
+}
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
+static bool gemv2(int, float *, float *, const void *, const void *, const void *, int) { return false; }
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+template <> bool gemv2<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0>(int n, float * s0, float * s1, const void * vx, const void * vy0, const void * vy1, int nc) {
+    ggml_gemv2_iq4_nl_4x4_q8_0(n, s0, s1, vx, vy0, vy1, nc);
+    return true;
+}
+#endif
+
 template <> void gemv<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_iq4_nl_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -4945,7 +4961,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                                              src0_ptr + src0_start * nb01, src1_ptr,
                                                              nrows - (nrows % 4), ncols);
         }
-        for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+        int64_t iter0 = nrows - (nrows % 4);
+        if (nrows - iter0 >= 2 && s10_gemv2_enabled() &&
+            gemv2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter0 * nb1)) + src0_start,
+                                                              (float *) (dst_ptr + ((iter0 + 1) * nb1)) + src0_start,
+                                                              src0_ptr + src0_start * nb01,
+                                                              src1_ptr + (src1_col_stride * iter0),
+                                                              src1_ptr + (src1_col_stride * (iter0 + 1)), ncols)) {
+            iter0 += 2;
+        }
+        for (int iter = iter0; iter < nrows; iter++) {
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                              ne01, src0_ptr + src0_start * nb01,
                                                              src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
