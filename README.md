@@ -8,7 +8,9 @@
 >   that decodes each row pair once (`ggml/src/ggml-cpu/`).
 > - A Mali GPU assist (`ggml/src/ggml-cpu/s10-gpu-assist.c`, CMake `GGML_CPU_S10_GPU_ASSIST`): the GPU computes part
 >   of every PTQ1_0 matrix product over OpenCL (Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s generation.
-> - A faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
+> - A two-token IQ4_NL kernel that reads the weights once for 2-token batches (+21%; speculative-decoding checks),
+>   a faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
+> - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): +18% on code, +35% on edits.
 >
 > **The S10 project.**
 >
