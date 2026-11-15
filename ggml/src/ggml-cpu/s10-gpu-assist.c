@@ -13,6 +13,7 @@
 #include "s10-gpu-assist.h"
 #include "s10-gpu-assist-kernel.h"
 #include "s10-gpu-assist-mm4.h"
+#include "s10-gpu-assist-mm8.h"
 #include "ggml-impl.h"
 
 #include <math.h>
@@ -64,7 +65,8 @@ static float s10ga_frac_for(const char * name) {
 static double     g_min_bytes;   // GGML_S10_GPU_MINMB: only tensors at least this big (MiB) get GPU rows
 static cl_context g_ctx;
 static cl_command_queue g_q;
-static cl_kernel  g_kern, g_kern8, g_kern_tail, g_kern_mm4; // mm4: prompt kernel, 4 rows x 4 columns per item
+static cl_kernel  g_kern, g_kern8, g_kern_tail, g_kern_mm4; // mm4: prompt kernel, 4 rows x g_mmc columns per item
+static int        g_mmc = 4;    // columns per prompt work-item (GGML_S10_GPU_MMC=8 selects the 8-column kernel)
 static struct s10ga_entry g_tab[S10GA_TABLE];
 static size_t     g_gpu_bytes;
 static int        g_ntensors;
@@ -148,8 +150,8 @@ static int s10ga_init_cl(void) {
     g_q = clCreateCommandQueueWithProperties(g_ctx, dev, getenv("GGML_S10_GPU_PROF") ? qprops : NULL, &err);
     if (err != CL_SUCCESS) { return 0; }
 
-    const char * srcs[2] = { s10ga_kernel_src, s10ga_kernel_mm4_src };
-    cl_program prog = clCreateProgramWithSource(g_ctx, 2, srcs, NULL, &err);
+    const char * srcs[3] = { s10ga_kernel_src, s10ga_kernel_mm4_src, s10ga_kernel_mm8_src };
+    cl_program prog = clCreateProgramWithSource(g_ctx, 3, srcs, NULL, &err);
     if (err != CL_SUCCESS) { return 0; }
     err = clBuildProgram(prog, 1, &dev, "-cl-std=CL3.0", NULL, NULL);
     if (err != CL_SUCCESS) {
@@ -167,7 +169,8 @@ static int s10ga_init_cl(void) {
     }
     if (err == CL_SUCCESS && !(getenv("GGML_S10_GPU_MM4") && atoi(getenv("GGML_S10_GPU_MM4")) == 0)) {
         cl_int e4;
-        g_kern_mm4 = clCreateKernel(prog, "s10ga_ptq1_mm4", &e4);   // optional; prompts fall back to mv
+        if (getenv("GGML_S10_GPU_MMC") && atoi(getenv("GGML_S10_GPU_MMC")) == 8) { g_mmc = 8; }
+        g_kern_mm4 = clCreateKernel(prog, g_mmc == 8 ? "s10ga_ptq1_mm8" : "s10ga_ptq1_mm4", &e4);   // optional; prompts fall back to mv
         if (e4 != CL_SUCCESS) { g_kern_mm4 = NULL; }
     }
     clReleaseProgram(prog);
@@ -323,7 +326,7 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
     const int tile_rows = tile * slots, wg = lanes * slots;
     // Prompts (4+ columns, no K tail): the mm4 kernel loads each weight word once for 4 columns.
     int64_t col0 = 0;
-    if (g_kern_mm4 && !tail && ncols >= 4) {
+    if (g_kern_mm4 && !tail && ncols >= g_mmc) {
         const int s4 = (R % 8 == 0) ? 2 : 1;                     // rows are 4-aligned; two row slots when possible
         const int tr4 = 4 * s4, wg4 = lanes * s4;
         cl_kernel k4 = g_kern_mm4;
@@ -335,18 +338,18 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
         clSetKernelArg(k4, 5, sizeof(int), &nbi);
         clSetKernelArg(k4, 6, sizeof(int), &Ri);
         clSetKernelArg(k4, 7, sizeof(int), &lanes);
-        clSetKernelArg(k4, 8, wg4 * 16 * sizeof(float), NULL);
+        clSetKernelArg(k4, 8, wg4 * 4 * g_mmc * sizeof(float), NULL);
         clSetKernelArg(k4, 11, sizeof(cl_mem), &g_bas);
-        const int64_t rl4 = S10GA_MAX_ROWS / 4 / tr4 * tr4;      // a quad does 4x the work of one column
+        const int64_t rl4 = S10GA_MAX_ROWS / g_mmc / tr4 * tr4;  // a column group does g_mmc x the work of one column
         const int64_t rp4 = R < rl4 ? R : (rl4 > 0 ? rl4 : tr4);
-        int64_t qp4 = S10GA_MAX_ROWS / 4 / rp4;
+        int64_t qp4 = S10GA_MAX_ROWS / g_mmc / rp4;
         if (qp4 < 1) qp4 = 1;
-        const int64_t nq = ncols / 4;
+        const int64_t nq = ncols / g_mmc;
         for (int64_t q0 = 0; q0 < nq; q0 += qp4) {
             const int64_t nqq = nq - q0 < qp4 ? nq - q0 : qp4;
             for (int64_t r0 = 0; r0 < R; r0 += rp4) {
                 const int64_t nr = R - r0 < rp4 ? R - r0 : rp4;
-                const int group_base = (int) (r0 / tr4), col_base = (int) (q0 * 4);
+                const int group_base = (int) (r0 / tr4), col_base = (int) (q0 * g_mmc);
                 clSetKernelArg(k4, 9, sizeof(int), &group_base);
                 clSetKernelArg(k4, 10, sizeof(int), &col_base);
                 const size_t global[2] = { (size_t) (nr / tr4) * wg4, (size_t) nqq };
@@ -359,7 +362,7 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
                 }
             }
         }
-        col0 = nq * 4;
+        col0 = nq * g_mmc;
         if (col0 == ncols) {
             return;
         }
