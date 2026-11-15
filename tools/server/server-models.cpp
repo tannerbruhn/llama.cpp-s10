@@ -2090,6 +2090,15 @@ static void res_err(std::unique_ptr<server_http_res> & res, const json & error_d
 }
 
 static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
+    // LLAMA_ROUTER_DEFAULT_MODEL: serve requests with no or an unknown model name from this model
+    // (single-model servers ignore the name; this keeps such clients working behind the router)
+    static const std::string default_model = common_get_env("LLAMA_ROUTER_DEFAULT_MODEL");
+    if (!default_model.empty() && (name.empty() || !models.get_meta(name).has_value())) {
+        if (!name.empty()) {
+            SRV_WRN("model '%s' not found, using default model '%s'\n", name.c_str(), default_model.c_str());
+        }
+        name = default_model;
+    }
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
