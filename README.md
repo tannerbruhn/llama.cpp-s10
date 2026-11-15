@@ -10,10 +10,20 @@
 >   of every PTQ1_0 matrix product over OpenCL (Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s generation.
 > - A faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
 >
-> Recipes (models, quantization, server, measured numbers): https://github.com/tannerbruhn/s10-llm-recipes.
-> Kernel and U-Boot for the phone: https://github.com/tannerbruhn/exynos-9820-mainline-linux and
-> https://github.com/tannerbruhn/u-boot (general S10 support: Wi-Fi, charger, GPU). Updates:
-> [@t24_lab on X](https://x.com/t24_lab).
+> **The S10 project.**
+>
+> These four repos turn an old Samsung Galaxy S10 (SM-G973F, Exynos 9820) into a small always-on LLM server under
+> postmarketOS. The kernel and U-Boot forks are general S10 support; the other two are the LLM side.
+>
+> - [exynos-9820-mainline-linux](https://github.com/tannerbruhn/exynos-9820-mainline-linux): kernel (Wi-Fi, charger,
+>   Mali-G76 GPU through Panfrost)
+> - [u-boot](https://github.com/tannerbruhn/u-boot): bootloader and device tree (Wi-Fi, reserved memory, GPU node and
+>   clocks)
+> - [llama.cpp-s10](https://github.com/tannerbruhn/llama.cpp-s10): inference (ternary CPU kernels, Mali GPU assist)
+> - [s10-llm-recipes](https://github.com/tannerbruhn/s10-llm-recipes): models, quantization, server setup, measured
+>   numbers
+>
+> Updates: [@t24_lab on X](https://x.com/t24_lab)
 
 # llama.cpp
 
