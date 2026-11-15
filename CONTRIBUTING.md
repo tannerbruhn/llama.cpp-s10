@@ -1,3 +1,7 @@
+> [!NOTE]
+> **llama.cpp-s10:** this guide and its AI policy are upstream's and apply to contributions sent to ggml-org/llama.cpp.
+> For work on this fork, see [AGENTS.md](AGENTS.md).
+
 # Contributors
 
 The project differentiates between 3 levels of contributors:
