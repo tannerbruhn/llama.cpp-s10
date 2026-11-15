@@ -1,3 +1,20 @@
+# llama.cpp for the Samsung Galaxy S10
+
+> [!NOTE]
+> **This branch runs LLMs on a Galaxy S10 (Exynos 9820, Mali-G76, 8 GB) under postmarketOS.** It is the PrismML
+> llama.cpp (for the ternary Bonsai models) plus S10 work on top. This port was AI-written and tested on the phone.
+>
+> - ARM CPU kernels for ternary PTQ1_0: a lean block decoder, a two-row kernel with prefetch, and a prompt kernel
+>   that decodes each row pair once (`ggml/src/ggml-cpu/`).
+> - A Mali GPU assist (`ggml/src/ggml-cpu/s10-gpu-assist.c`, CMake `GGML_CPU_S10_GPU_ASSIST`): the GPU computes part
+>   of every PTQ1_0 matrix product over OpenCL (Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s generation.
+> - A faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
+>
+> Recipes (models, quantization, server, measured numbers): https://github.com/tannerbruhn/s10-llm-recipes.
+> Kernel and U-Boot for the phone: https://github.com/tannerbruhn/exynos-9820-mainline-linux and
+> https://github.com/tannerbruhn/u-boot (general S10 support: Wi-Fi, charger, GPU). Updates:
+> [@t24_lab on X](https://x.com/t24_lab).
+
 # llama.cpp
 
 > [!IMPORTANT]
