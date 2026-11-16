@@ -1549,6 +1549,11 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
     const int64_t ir0_base = s10ga_rows;
+#ifdef GGML_S10_GPU_ASSIST
+    if (ith == 0 && ir0_base > 0) {
+        ggml_s10ga_submit();
+    }
+#endif
 
 #if GGML_USE_LLAMAFILE
     if (!params->use_ref && src1->type != vec_dot_type && ir0_base == 0) {
@@ -3313,8 +3318,8 @@ static void s10p_add(const char * key, double dt) {
 static void s10p_key(const struct ggml_tensor * node, int fused, char * key) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const struct ggml_tensor * w = node->src[0];
-        snprintf(key, 48, "%s%s %s %s n%lld", fused ? "fused " : "", ggml_op_desc(node), ggml_type_name(w->type),
-                 ggml_nbytes(w) >= 6u << 20 ? ">=6MB" : "<6MB", (long long) node->src[1]->ne[1]);
+        snprintf(key, 48, "%s%s %s %lldx%lld n%lld", fused ? "fused " : "", ggml_op_desc(node), ggml_type_name(w->type),
+                 (long long) w->ne[0], (long long) w->ne[1], (long long) node->src[1]->ne[1]);
     } else {
         snprintf(key, 48, "%s%s", fused ? "fused " : "", ggml_op_desc(node));
     }
