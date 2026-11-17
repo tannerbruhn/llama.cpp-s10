@@ -55,6 +55,14 @@ void ggml_ptq1_0_decode_row_s10(int n, const void * GGML_RESTRICT vx, int8_t * G
 void ggml_ptq1_0_dot_dec_2x4_s10(int n, const int8_t * GGML_RESTRICT q0, const int8_t * GGML_RESTRICT q1,
                                  const float * GGML_RESTRICT d0, const float * GGML_RESTRICT d1,
                                  const void * GGML_RESTRICT vy, size_t by, float * GGML_RESTRICT s0, float * GGML_RESTRICT s1);
+// S10 spec C: s2 rows (2-bit codes + fp16 scales), see arch/arm/quants.c.
+void ggml_s10i2_encode_row(int n, const void * GGML_RESTRICT ptq_row, uint8_t * GGML_RESTRICT codes,
+                           ggml_half * GGML_RESTRICT scales, int8_t * GGML_RESTRICT tmp_q, float * GGML_RESTRICT tmp_d);
+void ggml_s10i2_decode_row(int n, const uint8_t * GGML_RESTRICT codes, const ggml_half * GGML_RESTRICT scales,
+                           int8_t * GGML_RESTRICT q, float * GGML_RESTRICT d);
+void ggml_vec_dot_s10i2_q8_0_x2(int n, float * GGML_RESTRICT s, const uint8_t * GGML_RESTRICT c0, const uint8_t * GGML_RESTRICT c1,
+                                const ggml_half * GGML_RESTRICT d0, const ggml_half * GGML_RESTRICT d1,
+                                const void * GGML_RESTRICT vy, size_t prefetch);
 #endif
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
