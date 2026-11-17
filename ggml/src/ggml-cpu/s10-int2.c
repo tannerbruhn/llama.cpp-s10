@@ -46,7 +46,15 @@ static size_t s10i2_align64(size_t n) {
     return (n + 63) & ~(size_t) 63;
 }
 
+static void s10i2_init_pool(void);
+static int g_pool_tried;
+
 static void * s10i2_alloc(size_t n) {
+    // open the pool at the first conversion, not at init: a process with no PTQ1_0 tensors must not hold it
+    if (!g_pool_tried) {
+        g_pool_tried = 1;
+        s10i2_init_pool();
+    }
     n = s10i2_align64(n);
     if (g_pool && g_pool_used + n <= g_pool_size) {
         void * p = g_pool + g_pool_used;
@@ -157,7 +165,6 @@ static int s10i2_init(void) {
             g_pf_pairs = 0;
         }
     }
-    s10i2_init_pool();
     return 1;
 }
 
