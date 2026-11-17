@@ -3603,10 +3603,15 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
 #ifdef GGML_USE_OPENMP
     int32_t cpumask_iter = 0;
+    // S10: GGML_S10_T0LAST puts thread 0 (which drives the GPU assist) on the last CPU of the mask (an M4 with -C 0xf0)
+    const bool t0last = getenv("GGML_S10_T0LAST") != NULL;
 
     // Compute CPU masks for each thread
-    for (int j = 0; j < tpp->n_threads; j++) {
+    for (int j = t0last ? 1 : 0; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+    }
+    if (t0last) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
 #else // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
