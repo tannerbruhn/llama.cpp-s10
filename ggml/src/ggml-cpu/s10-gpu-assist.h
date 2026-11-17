@@ -14,6 +14,9 @@ extern "C" {
 // took (a multiple of 64), or 0 when the assist does not apply.
 int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tensor * src1);
 
+// Thread 0 only, right after the barrier. Runs any submit deferred by GGML_S10_GPU_LATE=1.
+void ggml_s10ga_submit(void);
+
 // Thread 0 only, after its CPU chunks. Waits for the GPU and writes its rows into dst.
 void ggml_s10ga_end(struct ggml_tensor * dst, int64_t rows);
 

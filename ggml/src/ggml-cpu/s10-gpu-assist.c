@@ -16,6 +16,10 @@
 #include "s10-gpu-assist-mm8.h"
 #include "ggml-impl.h"
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +59,9 @@ static long    g_n_used, g_n_dropped, g_n_queued;
 static int        g_state = -1;   // -1 not initialized, 0 off, 1 on
 static float      g_frac;
 static int        g_check;
+static int        g_late, g_qneon, g_qcheck, g_deferred;
+static struct s10ga_entry * g_def_e;
+static const struct ggml_tensor * g_def_src0, * g_def_src1;
 // per-shape shares (default: GGML_S10_GPU_FRAC): GGML_S10_GPU_FRAC_UPGATE, _DOWN, _OTHER
 static float      g_frac_upgate = -1, g_frac_down = -1, g_frac_other = -1;
 static float s10ga_frac_for(const char * name) {
@@ -79,6 +86,10 @@ static double g_t[6], g_tcpu, g_tgpu, g_tbegin_end, g_tq2sub, g_tsub2start;
 static cl_event g_last_ev;
 static cl_event g_read_ev;   // non-blocking result read queued in begin(), polled in end()
 static long   g_calls;
+// Cumulative host timings: latency/waits cover submits, plan covers submits + fused collects.
+static double g_h_plan, g_h_cpu_wait, g_h_gpu_idle;
+static long g_h_collect;
+static int g_h_t0cpu = -1;
 static int8_t * g_hqx; static float * g_hdx, * g_hy; static size_t g_hcap_qx, g_hcap_dx, g_hcap_y;
 static double s10ga_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static void * s10ga_host(void * p, size_t * cap, size_t need) {
@@ -114,6 +125,12 @@ static int s10ga_init(void) {
     g_min_bytes = getenv("GGML_S10_GPU_MINMB") ? atof(getenv("GGML_S10_GPU_MINMB")) * 1048576.0 : 0.0;
     g_fuse  = !(getenv("GGML_S10_GPU_FUSE") && atoi(getenv("GGML_S10_GPU_FUSE")) == 0);
     g_xfer  = !(getenv("GGML_S10_GPU_XFER") && atoi(getenv("GGML_S10_GPU_XFER")) == 0);
+    g_late = getenv("GGML_S10_GPU_LATE") && atoi(getenv("GGML_S10_GPU_LATE")) != 0;
+    g_late = g_late && g_xfer;   // map failures must still be able to fall back before the barrier
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    g_qneon = getenv("GGML_S10_GPU_QNEON") && atoi(getenv("GGML_S10_GPU_QNEON")) != 0;
+    g_qcheck = getenv("GGML_S10_GPU_QCHECK") && atoi(getenv("GGML_S10_GPU_QCHECK")) != 0;
+#endif
     if (!(g_frac > 0.0f && g_frac < 1.0f)) {
         return 0;
     }
@@ -403,48 +420,56 @@ static void s10ga_enqueue_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, 
     }
 }
 
-int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
-    // checked before init, so a model without PTQ1_0 weights never opens an OpenCL context
-    if (src0->type != GGML_TYPE_PTQ1_0) {
-        return 0;
-    }
-    if (g_state < 0) {
-        g_state = s10ga_init();
-    }
-    if (g_state == 0 || src1->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
-        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-        src0->ne[0] % 128 != 0) {
-        return 0;
-    }
-    struct s10ga_entry * e = s10ga_lookup(src0);
-    if (!e || e->rows == 0) {
-        return 0;
-    }
-
-    const int64_t K = src0->ne[0], nb = K / 128, R = e->rows, ncols = src1->ne[1];
-    if (g_fake) { g_t_flush = s10ga_now(); return R; }
-    g_cur_is_pend = 0;
-    if (g_pend) {
-        if (g_pend == e && g_pend_x == src1->data && g_pend_ncols == ncols) {
-            g_cur_is_pend = 1;           // queued by the gate call; end() collects it
-            g_n_used++;
-            return R;
+static void s10ga_quant128_scalar(const float * x, int64_t nb, int8_t * qx, float * dx, int32_t * as) {
+    for (int64_t b = 0; b < nb; b++) {
+        float amax = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            amax = fmaxf(amax, fabsf(x[b * 128 + j]));
         }
-        g_n_dropped++;
-        if (getenv("GGML_S10_GPU_FUSEDBG") && g_n_dropped < 5) fprintf(stderr, "s10-gpu-assist fuse drop: pending %s x=%p n=%lld, got %s x=%p n=%lld\n", g_pend->name, g_pend_x, (long long) g_pend_ncols, e->name, src1->data, (long long) ncols);
-        clWaitForEvents(1, &g_pend_rev);  // not consumed: let it finish and drop it
-        clReleaseEvent(g_pend_kev); clReleaseEvent(g_pend_rev);
-        g_pend = NULL;
+        const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        dx[b] = d;
+        int32_t sum = 0;
+        for (int j = 0; j < 128; j++) {
+            const int8_t q = (int8_t) lrintf(x[b * 128 + j] * id);
+            qx[b * 128 + j] = q;
+            sum += q;
+        }
+        as[b] = sum;
     }
-    if (!s10ga_reserve(&g_bqx, &g_cap_qx, (size_t) ncols * K) ||
-        !s10ga_reserve(&g_bdx, &g_cap_dx, (size_t) ncols * nb * sizeof(float)) ||
-        !s10ga_reserve(&g_bas, &g_cap_as, (size_t) ncols * nb * sizeof(int32_t)) ||
-        !s10ga_reserve(&g_by,  &g_cap_y,  (size_t) ncols * R * sizeof(float))) {
-        return 0;
+}
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+// One column, with the same scale arithmetic and nearest-even rounding as the scalar loop.
+static void s10ga_quant128_neon(const float * x, int64_t nb, int8_t * qx, float * dx, int32_t * as) {
+    for (int64_t b = 0; b < nb; b++, x += 128, qx += 128) {
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 128; j += 4) m = vmaxnmq_f32(m, vabsq_f32(vld1q_f32(x + j)));
+        const float amax = vmaxnmvq_f32(m);
+        const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        // Very small denormal blocks can overflow the reciprocal; preserve scalar conversion semantics.
+        if (!isfinite(id)) {
+            s10ga_quant128_scalar(x, 1, qx, dx + b, as + b);
+            continue;
+        }
+        dx[b] = d;
+        int32_t sum = 0;
+        for (int j = 0; j < 128; j += 16) {
+            const int32x4_t a0 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(x + j),      id));
+            const int32x4_t a1 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(x + j + 4),  id));
+            const int32x4_t a2 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(x + j + 8),  id));
+            const int32x4_t a3 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(x + j + 12), id));
+            const int8x16_t q = vcombine_s8(vqmovn_s16(vcombine_s16(vqmovn_s32(a0), vqmovn_s32(a1))),
+                                           vqmovn_s16(vcombine_s16(vqmovn_s32(a2), vqmovn_s32(a3))));
+            vst1q_s8(qx + j, q);
+            sum += vaddlvq_s8(q);
+        }
+        as[b] = sum;
     }
+}
+#endif
 
-
+static int64_t s10ga_submit_impl(struct s10ga_entry * e, const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+    const int64_t K = src0->ne[0], nb = K / 128, R = e->rows, ncols = src1->ne[1];
     cl_int err;
     const double t0 = s10ga_now();
     int8_t * qx; float * dx;
@@ -458,24 +483,43 @@ int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tens
         if (err != CL_SUCCESS) { clEnqueueUnmapMemObject(g_q, g_bqx, qx, 0, NULL, NULL); return 0; }
     }
     g_has = s10ga_host(g_has, &g_hcap_as, (size_t) ncols * nb * sizeof(int32_t));
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    static int checked;
+    static int8_t * check_qx;
+    static float * check_dx;
+    static int32_t * check_as;
+    static size_t cap_qx, cap_dx, cap_as;
+    const int qcheck = g_qcheck && checked < 2000;
+    if (qcheck) {
+        checked++;
+        check_qx = s10ga_host(check_qx, &cap_qx, (size_t) K);
+        check_dx = s10ga_host(check_dx, &cap_dx, (size_t) nb * sizeof(float));
+        check_as = s10ga_host(check_as, &cap_as, (size_t) nb * sizeof(int32_t));
+        GGML_ASSERT(check_qx && check_dx && check_as);
+    }
+#endif
     const double t1 = s10ga_now();
     for (int64_t c = 0; c < ncols; c++) {
         const float * x = (const float *) ((const char *) src1->data + c * src1->nb[1]);
-        for (int64_t b = 0; b < nb; b++) {
-            float amax = 0.0f;
-            for (int j = 0; j < 128; j++) {
-                amax = fmaxf(amax, fabsf(x[b * 128 + j]));
-            }
-            const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
-            dx[c * nb + b] = d;
-            int32_t sum = 0;
-            for (int j = 0; j < 128; j++) {
-                const int8_t q = (int8_t) lrintf(x[b * 128 + j] * id);
-                qx[c * K + b * 128 + j] = q;
-                sum += q;
-            }
-            g_has[c * nb + b] = sum;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (g_qneon) {
+            s10ga_quant128_neon(x, nb, qx + c * K, dx + c * nb, g_has + c * nb);
+        } else
+#endif
+        {
+            s10ga_quant128_scalar(x, nb, qx + c * K, dx + c * nb, g_has + c * nb);
         }
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (qcheck) {
+            if (g_qneon) s10ga_quant128_scalar(x, nb, check_qx, check_dx, check_as);
+            else         s10ga_quant128_neon(x, nb, check_qx, check_dx, check_as);
+            if (memcmp(qx + c * K, check_qx, (size_t) K) ||
+                memcmp(dx + c * nb, check_dx, (size_t) nb * sizeof(float)) ||
+                memcmp(g_has + c * nb, check_as, (size_t) nb * sizeof(int32_t))) {
+                GGML_ABORT("s10-gpu-assist: QCHECK mismatch for %s", src0->name);
+            }
+        }
+#endif
     }
     const double t2 = s10ga_now();
     if (g_xfer) {
@@ -516,6 +560,67 @@ int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tens
     const double t4 = s10ga_now();
     g_t[0] += t1 - t0; g_t[1] += t2 - t1; g_t[2] += t3 - t2; g_t[3] += t4 - t3; g_tbegin_end = t4;
     return R;
+}
+
+int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+    const double tplan = g_hprof || g_state < 0 ? s10ga_now() : 0.0;
+    // checked before init, so a model without PTQ1_0 weights never opens an OpenCL context
+    if (src0->type != GGML_TYPE_PTQ1_0) {
+        return 0;
+    }
+    if (g_state < 0) {
+        g_state = s10ga_init();
+    }
+    if (g_state == 0 || src1->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        src0->ne[0] % 128 != 0) {
+        return 0;
+    }
+    struct s10ga_entry * e = s10ga_lookup(src0);
+    if (!e || e->rows == 0) {
+        return 0;
+    }
+
+    const int64_t K = src0->ne[0], nb = K / 128, R = e->rows, ncols = src1->ne[1];
+    if (g_fake) { g_t_flush = s10ga_now(); return R; }
+    g_cur_is_pend = 0;
+    if (g_pend) {
+        if (g_pend == e && g_pend_x == src1->data && g_pend_ncols == ncols) {
+            g_cur_is_pend = 1;           // queued by the gate call; end() collects it
+            g_n_used++;
+            if (g_hprof) { g_h_plan += s10ga_now() - tplan; g_h_collect++; }
+            return R;
+        }
+        g_n_dropped++;
+        if (getenv("GGML_S10_GPU_FUSEDBG") && g_n_dropped < 5) fprintf(stderr, "s10-gpu-assist fuse drop: pending %s x=%p n=%lld, got %s x=%p n=%lld\n", g_pend->name, g_pend_x, (long long) g_pend_ncols, e->name, src1->data, (long long) ncols);
+        clWaitForEvents(1, &g_pend_rev);  // not consumed: let it finish and drop it
+        clReleaseEvent(g_pend_kev); clReleaseEvent(g_pend_rev);
+        g_pend = NULL;
+    }
+    if (!s10ga_reserve(&g_bqx, &g_cap_qx, (size_t) ncols * K) ||
+        !s10ga_reserve(&g_bdx, &g_cap_dx, (size_t) ncols * nb * sizeof(float)) ||
+        !s10ga_reserve(&g_bas, &g_cap_as, (size_t) ncols * nb * sizeof(int32_t)) ||
+        !s10ga_reserve(&g_by,  &g_cap_y,  (size_t) ncols * R * sizeof(float))) {
+        return 0;
+    }
+    const double plan_time = g_hprof ? s10ga_now() - tplan : 0.0;
+    if (!g_late) {
+        const int64_t rows = s10ga_submit_impl(e, src0, src1);
+        if (g_hprof && rows) g_h_plan += plan_time;
+        return rows;
+    }
+    if (g_hprof) g_h_plan += plan_time;
+    g_def_e = e; g_def_src0 = src0; g_def_src1 = src1; g_deferred = 1;
+    return R;
+}
+
+void ggml_s10ga_submit(void) {
+    if (!g_deferred) return;
+    g_deferred = 0;
+    // Late mode requires XFER=1, so no map failure can change the published row count.
+    const int64_t rows = s10ga_submit_impl(g_def_e, g_def_src0, g_def_src1);
+    GGML_ASSERT(rows == g_def_e->rows);
 }
 
 static void s10ga_check(const struct ggml_tensor * dst, int64_t R) {
@@ -593,9 +698,15 @@ void ggml_s10ga_end(struct ggml_tensor * dst, int64_t R) {
             const double tw = s10ga_now();
             while (g_t_done == 0) { }
             g_h_lat += g_t_done - g_t_flush; g_h_cpu += t0 - g_t_flush; g_h_wait += tw - (g_spin ? tk : t0);
+            g_h_cpu_wait += fmax(0.0, g_t_done - t0);
+            g_h_gpu_idle += fmax(0.0, t0 - g_t_done);
+            if (g_h_n % 400 == 0) g_h_t0cpu = sched_getcpu();
             if (++g_h_n % 400 == 0) {
-                fprintf(stderr, "s10-gpu-assist hprof (ms/call over %ld): flush->%s complete %.3f  flush->cpu done %.3f  %s->read seen %.3f\n",
-                        g_h_n, g_spin ? "kernel" : "read", g_h_lat / g_h_n * 1e3, g_h_cpu / g_h_n * 1e3, g_spin ? "kernel seen" : "cpu done", g_h_wait / g_h_n * 1e3);
+                fprintf(stderr, "s10-gpu-assist hprof (ms/call over %ld): flush->%s complete %.3f  flush->cpu done %.3f  %s->read seen %.3f | plan %.3f quant %.3f write %.3f enqueue %.3f | cpu-waits %.3f gpu-idle %.3f | submits %ld of %ld late %d qneon %d t0cpu %d\n",
+                        g_h_n + g_h_collect, g_spin ? "kernel" : "read", g_h_lat / g_h_n * 1e3, g_h_cpu / g_h_n * 1e3, g_spin ? "kernel seen" : "cpu done", g_h_wait / g_h_n * 1e3,
+                        g_h_plan / (g_h_n + g_h_collect) * 1e3, g_t[1] / g_h_n * 1e3, g_t[2] / g_h_n * 1e3, g_t[3] / g_h_n * 1e3,
+                        g_h_cpu_wait / g_h_n * 1e3, g_h_gpu_idle / g_h_n * 1e3,
+                        g_h_n, g_h_n + g_h_collect, g_late, g_qneon, g_h_t0cpu);
             }
         }
         clReleaseEvent(g_read_ev);
