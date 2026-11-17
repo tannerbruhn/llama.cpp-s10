@@ -8,6 +8,7 @@
 #ifdef GGML_S10_GPU_ASSIST
 #include "s10-gpu-assist.h"
 #endif
+#include "s10-int2.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1209,6 +1210,8 @@ static inline ggml_vec_dot_t ggml_cpu_vec_dot(const struct ggml_tensor * src0) {
     return type_traits_cpu[src0->type].vec_dot;
 }
 
+static const struct ggml_s10i2 * g_s10i2_cur;   // set by thread 0 before the barrier of each mat-mul
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1244,6 +1247,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+#if defined(__aarch64__)
+    if (g_s10i2_cur != NULL && g_s10i2_cur->key == src0->data) {
+        ggml_s10i2_chunk(g_s10i2_cur, (int) ne00, wdata, row_size, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        return;
+    }
+#endif
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
@@ -1539,6 +1549,12 @@ UseGgmlGemm1:;
     }
 #else
     const int64_t s10ga_rows = 0;
+#endif
+
+#if defined(__aarch64__)
+    if (ith == 0) {
+        g_s10i2_cur = params->use_ref ? NULL : ggml_s10i2_get(src0, src1, s10ga_rows);
+    }
 #endif
 
     if (ith == 0) {
@@ -3313,8 +3329,8 @@ static void s10p_add(const char * key, double dt) {
 static void s10p_key(const struct ggml_tensor * node, int fused, char * key) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const struct ggml_tensor * w = node->src[0];
-        snprintf(key, 48, "%s%s %s %s n%lld", fused ? "fused " : "", ggml_op_desc(node), ggml_type_name(w->type),
-                 ggml_nbytes(w) >= 6u << 20 ? ">=6MB" : "<6MB", (long long) node->src[1]->ne[1]);
+        snprintf(key, 48, "%s%s %s %lldx%lld n%lld", fused ? "fused " : "", ggml_op_desc(node), ggml_type_name(w->type),
+                 (long long) w->ne[0], (long long) w->ne[1], (long long) node->src[1]->ne[1]);
     } else {
         snprintf(key, 48, "%s%s", fused ? "fused " : "", ggml_op_desc(node));
     }
