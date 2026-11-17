@@ -278,13 +278,15 @@ static struct ggml_s10i2 * s10i2_lookup(const struct ggml_tensor * src0, const s
             uint8_t * codes = mem;
             ggml_half * scales = (ggml_half *) (mem + s10i2_align64(codes_bytes));
 
-            int8_t tmp_q[32768] __attribute__((aligned(64)));
-            float tmp_d[256];
+            int8_t * tmp_q = malloc(32768);
+            float * tmp_d = malloc(256 * sizeof(float));
+            GGML_ASSERT(tmp_q && tmp_d);
             for (int64_t r = 0; r < rows; ++r) {
                 const void * ptq = (const char *) src0->data + (gpu_rows + r) * src0->nb[1];
                 ggml_s10i2_encode_row((int) src0->ne[0], ptq,
                                       codes + r * nb * 32, scales + r * nb, tmp_q, tmp_d);
             }
+            free(tmp_q); free(tmp_d);
 
             e->codes = codes;
             e->scales = (const uint16_t *) scales;
@@ -378,9 +380,16 @@ void ggml_s10i2_chunk(const struct ggml_s10i2 * e, int n, const void * y, size_t
         return;
     }
 
-    int8_t q0[32768] __attribute__((aligned(64)));
-    int8_t q1[32768] __attribute__((aligned(64)));
-    float d0[256], d1[256];
+    // per-thread heap buffers: worker threads on musl have 128 KiB stacks, 64 KiB of rows here overflowed them
+    static _Thread_local int8_t * tl_q;
+    static _Thread_local float * tl_d;
+    if (!tl_q) {
+        tl_q = aligned_alloc(64, 2 * 32768);
+        tl_d = malloc(2 * 256 * sizeof(float));
+        GGML_ASSERT(tl_q && tl_d);
+    }
+    int8_t * q0 = tl_q, * q1 = tl_q + 32768;
+    float * d0 = tl_d, * d1 = tl_d + 256;
     const int64_t ncols4 = ncols / 4 * 4;
     int64_t r = r0;
     for (; r + 1 < r1; r += 2) {
