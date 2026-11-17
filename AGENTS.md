@@ -25,6 +25,10 @@ All of these flags matter: without `GGML_PTQ1_LEAN2=1` the S10 PTQ1_0 kernels ar
 or runs about 2x slower); `GGML_NATIVE=ON` on a newer Arm build machine enables i8mm, which the S10 cannot run.
 The GPU assist also needs `clang23-headers` (Alpine) at runtime, or Rusticl cannot compile its kernel and the
 assist silently turns off.
+If the phone cannot download the server's web UI during the build (the `llama-ui-assets` step fails with
+"UI: download ... failed" or "missing required asset(s)"), configure with `-DLLAMA_USE_PREBUILT_UI=OFF
+-DLLAMA_BUILD_UI=OFF` and delete `build-mali/tools/ui/dist` if a partial download is there: the server then has no
+embedded UI, which is what `--no-webui` serves anyway.
 The GPU assist needs Mesa Rusticl on Panfrost (with the Bifrost int8-dot patch from the recipes repo) through
 `OCL_ICD_VENDORS`, and `RUSTICL_ENABLE=panfrost`.
 
