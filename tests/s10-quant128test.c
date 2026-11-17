@@ -1,4 +1,4 @@
-// Standalone: cc -O3 quant128test.c -lm -o quant128test
+// Standalone (not built by CMake): cc -O3 s10-quant128test.c -lm -o s10-quant128test
 // On the phone add -march=armv8.2-a+dotprod+fp16. Do not use fast-math.
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
