@@ -10,13 +10,21 @@ code to upstream (ggml-org/llama.cpp or PrismML-Eng/llama.cpp): follow their CON
 - Mali GPU assist: `ggml/src/ggml-cpu/s10-gpu-assist.{c,h}`, CMake option `GGML_CPU_S10_GPU_ASSIST`; runtime
   switches are `GGML_S10_GPU_*` environment variables.
 - Router default model: `LLAMA_ROUTER_DEFAULT_MODEL` in `tools/server/server-models.cpp`.
+- int2 CPU kernel (experimental): `ggml/src/ggml-cpu/s10-int2.{c,h}`, kernels in `arch/arm/quants.c`
+  (`ggml_s10i2_*`), switches `GGML_S10_INT2*`; bit-identity test `tests/test-s10-int2.cpp`.
 - Recipes, server config and measured numbers: https://github.com/tannerbruhn/s10-llm-recipes
 
 ## Build (on the phone, aarch64 musl)
 ```sh
-cmake -B build-mali -DCMAKE_BUILD_TYPE=Release -DGGML_CPU_S10_GPU_ASSIST=ON
+F="-DGGML_PTQ1_LEAN=0 -DGGML_PTQ1_LEAN2=1 -DGGML_PTQ1_PREFETCH=0"
+cmake -B build-mali -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 \
+  -DGGML_CPU_S10_GPU_ASSIST=ON -DCMAKE_C_FLAGS="$F" -DCMAKE_CXX_FLAGS="$F"
 cmake --build build-mali -j4 --target llama-server llama-bench llama-perplexity test-backend-ops
 ```
+All of these flags matter: without `GGML_PTQ1_LEAN2=1` the S10 PTQ1_0 kernels are compiled out (PTQ1_0 then aborts
+or runs about 2x slower); `GGML_NATIVE=ON` on a newer Arm build machine enables i8mm, which the S10 cannot run.
+The GPU assist also needs `clang23-headers` (Alpine) at runtime, or Rusticl cannot compile its kernel and the
+assist silently turns off.
 The GPU assist needs Mesa Rusticl on Panfrost (with the Bifrost int8-dot patch from the recipes repo) through
 `OCL_ICD_VENDORS`, and `RUSTICL_ENABLE=panfrost`.
 

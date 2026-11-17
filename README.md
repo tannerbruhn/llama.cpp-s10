@@ -11,6 +11,14 @@
 > - A two-token IQ4_NL kernel that reads the weights once for 2-token batches (+21%; speculative-decoding checks),
 >   a faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
 > - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): +18% on code, +35% on edits.
+> - **Experimental: int2 CPU kernel** (`ggml/src/ggml-cpu/s10-int2.c`, `GGML_S10_INT2=all`): the CPU's share of each
+>   PTQ1_0 matrix is re-encoded once in RAM as 2-bit codes and computed with a third fewer NEON instructions,
+>   bit-identical to the PTQ1_0 path (`tests/test-s10-int2.cpp`, greedy text and perplexity unchanged). Costs about
+>   +0.6 GB of RAM for the 27B; `GGML_S10_INT2_POOL=/dev/s10cpumem` can place the first part in otherwise unused
+>   memory (driver in the recipes repo). Bonsai 2 27B with the GPU assist at share 0.35: tg24 1.235 -> 1.34 tok/s;
+>   long answers through the server 0.74 -> 1.03-1.17 tok/s (fewer heat pauses). Tested on one phone.
+> - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`) and thread-0
+>   placement (`GGML_S10_T0LAST`): about +2% and within noise, kept for further work.
 >
 > **The S10 project.**
 >
