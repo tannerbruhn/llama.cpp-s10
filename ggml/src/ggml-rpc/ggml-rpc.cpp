@@ -2281,6 +2281,21 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     return true;
 }
 
+// GGML_RPC_COMM_PROFILE=1: every 256 all-reduces, print the average time per call spent waiting for the local
+// subgraph (synchronize), exchanging with the peer, reducing, and between calls (the next subgraph piece)
+struct rpc_comm_profile {
+    bool    on = [] { const char * e = getenv("GGML_RPC_COMM_PROFILE"); return e != nullptr && atoi(e) != 0; }();
+    int64_t n = 0, t_sync = 0, t_xchg = 0, t_red = 0, t_between = 0, t_last_end = 0;
+    void report() {
+        if (++n % 256 == 0) {
+            LOG_INFO("[comm_profile] %lld calls, per call: wait-local %.2f ms, exchange %.2f ms, reduce %.2f ms, between %.2f ms\n",
+                (long long) n, t_sync/256e3, t_xchg/256e3, t_red/256e3, t_between/256e3);
+            t_sync = t_xchg = t_red = t_between = 0;
+        }
+    }
+};
+static rpc_comm_profile g_comm_profile;
+
 bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (request.device >= backends.size()) {
         return false;
@@ -2349,8 +2364,13 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     };
 
+    const int64_t t0 = g_comm_profile.on ? ggml_time_us() : 0;
+    if (g_comm_profile.on && g_comm_profile.t_last_end != 0) {
+        g_comm_profile.t_between += t0 - g_comm_profile.t_last_end;
+    }
     // wait for the pending subgraph that produced this partial
     ggml_backend_synchronize(backend);
+    const int64_t t1 = g_comm_profile.on ? ggml_time_us() : 0;
 
     ggml_tensor * t_wire_send = nullptr;
     ggml_tensor * t_wire_recv = nullptr;
@@ -2377,6 +2397,29 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         }
     }
 
+    const int64_t t2 = g_comm_profile.on ? ggml_time_us() : 0;
+    // decode-sized f32 partials in host memory (CPU backend): add the peer's values in place instead of building
+    // and launching a one-node graph on the backend's thread pool, which costs a thread wake-up per sync
+    // (~2 per layer per token with -sm tensor). Switch: GGML_RPC_HOST_REDUCE=1 (off by default until measured).
+    static const bool host_reduce = [] {
+        const char * e = getenv("GGML_RPC_HOST_REDUCE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (host_reduce && !wire_bf16 && t_dst->type == GGML_TYPE_F32 && ggml_backend_buffer_is_host(t_dst->buffer) &&
+            ggml_is_contiguous(t_dst)) {
+        float       * dst  = (float *) t_dst->data;
+        const float * peer = (const float *) state.recv_buf.data();
+        for (int64_t i = 0; i < ne; i++) {
+            dst[i] += peer[i];
+        }
+        if (g_comm_profile.on) {
+            const int64_t t3 = ggml_time_us();
+            g_comm_profile.t_sync += t1 - t0; g_comm_profile.t_xchg += t2 - t1; g_comm_profile.t_red += t3 - t2;
+            g_comm_profile.t_last_end = t3; g_comm_profile.report();
+        }
+        return true;
+    }
+
     ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
     ggml_tensor * t_cast = nullptr;
     if (wire_bf16) {
@@ -2398,6 +2441,12 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         compute_nodes(t_cast, t_red);
     } else {
         compute_nodes(t_red, nullptr);
+    }
+    if (g_comm_profile.on) {
+        ggml_backend_synchronize(backend); // profiling only: include the reduce graph
+        const int64_t t3 = ggml_time_us();
+        g_comm_profile.t_sync += t1 - t0; g_comm_profile.t_xchg += t2 - t1; g_comm_profile.t_red += t3 - t2;
+        g_comm_profile.t_last_end = t3; g_comm_profile.report();
     }
     return true;
 }
