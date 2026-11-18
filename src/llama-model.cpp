@@ -403,7 +403,17 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // prism.hadamard per-weight sign vectors (-sm tensor, see load_tensors_hadamard) are split exactly like their weight:
+    // every rule below sees the weight's name, and the block size comes from the weight
+    static const std::regex pattern_hdmd_signs("blk\\.\\d*\\.(ffn_down|attn_output|ssm_out)\\.hdmd_signs");
+    std::string tensor_name = tensor->name;
+    const ggml_tensor * hdmd_weight = nullptr;
+    if (std::regex_match(tensor_name, pattern_hdmd_signs)) {
+        tensor_name = tensor_name.substr(0, tensor_name.size() - strlen(".hdmd_signs")) + ".weight";
+        hdmd_weight = ud->model->get_tensor(tensor_name.c_str());
+        GGML_ASSERT(hdmd_weight != nullptr);
+        GGML_ASSERT(hdmd_weight->ne[0] == tensor->ne[0]);
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -882,8 +892,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-        int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        if (const auto it = ud->model->hdmd.weight_blocks.find(tc.tensor_axis_0->name);
+        const ggml_tensor * blck_src = hdmd_weight ? hdmd_weight : tc.tensor_axis_0;
+        int64_t blck_size = ggml_blck_size(blck_src->type);
+        if (const auto it = ud->model->hdmd.weight_blocks.find(blck_src->name);
                 it != ud->model->hdmd.weight_blocks.end()) {
             blck_size = std::lcm(blck_size, int64_t(it->second));
         }
@@ -2268,6 +2279,7 @@ void llama_model_base::load_tensors_hadamard() {
 
     std::vector<hadamard_rotation> rotations;
     std::map<std::pair<uint32_t, ggml_backend_buffer_type_t>, ggml_tensor *> sign_tensors;
+    size_t n_per_weight_signs = 0; // -sm tensor: one sign vector per split-input weight
 
     const std::pair<const std::unordered_map<std::string, uint32_t> *, llama_hadamard_rotations *> groups[] = {
         { &hdmd.weight_blocks,  &hdmd.rot },
@@ -2368,8 +2380,16 @@ void llama_model_base::load_tensors_hadamard() {
                     throw std::runtime_error(format(
                         "prism.hadamard has no sign vector for width %u (%s)", width, weight_name.c_str()));
                 }
+                // with -sm tensor the inputs of these weights are split along their input axis, so each one needs
+                // its own sign vector, split the same way as the weight (see llama_meta_device_get_split_state).
+                // The split alternates between layers, so one shared vector per width cannot match them all.
+                static const std::regex pattern_split_input("blk\\.\\d+\\.(ffn_down|attn_output|ssm_out)\\.weight");
+                const bool per_weight = split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+                    std::regex_match(weight_name, pattern_split_input);
+                const std::string per_weight_name = per_weight ?
+                    weight_name.substr(0, weight_name.size() - strlen(".weight")) + ".hdmd_signs" : std::string();
                 const auto key = std::make_pair(width, buft);
-                auto st = sign_tensors.find(key);
+                auto st = per_weight ? sign_tensors.end() : sign_tensors.find(key);
                 if (st == sign_tensors.end()) {
                     ggml_init_params params = {
                         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2383,7 +2403,11 @@ void llama_model_base::load_tensors_hadamard() {
 
                     ggml_tensor * signs = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
                     char sign_name[GGML_MAX_NAME];
-                    snprintf(sign_name, sizeof(sign_name), "prism.hadamard.signs.%u", width);
+                    if (per_weight) {
+                        snprintf(sign_name, sizeof(sign_name), "%s", per_weight_name.c_str());
+                    } else {
+                        snprintf(sign_name, sizeof(sign_name), "prism.hadamard.signs.%u", width);
+                    }
                     ggml_set_name(signs, sign_name);
 
                     ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
@@ -2401,9 +2425,16 @@ void llama_model_base::load_tensors_hadamard() {
                     std::vector<ggml_backend_buffer_ptr> buffers;
                     buffers.emplace_back(std::move(buffer));
                     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
-                    st = sign_tensors.emplace(key, signs).first;
+                    if (per_weight) {
+                        sign_tensor = signs;
+                        n_per_weight_signs++;
+                    } else {
+                        st = sign_tensors.emplace(key, signs).first;
+                    }
                 }
-                sign_tensor = st->second;
+                if (!per_weight) {
+                    sign_tensor = st->second;
+                }
             }
 
             llama_hadamard_transform transform { it->tensor, sign_tensor };
@@ -2417,7 +2448,7 @@ void llama_model_base::load_tensors_hadamard() {
     }
 
     LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
-            __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
+            __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size() + n_per_weight_signs);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
