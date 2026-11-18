@@ -21,7 +21,10 @@
 > - Experimental: two phones over llama.cpp RPC. Layer split (`--rpc`, `-ngl 32`): the 27B at 1.16 tok/s over
 >   Wi-Fi, both phones cool, ~4 GB free on the first. Tensor parallel (`-sm tensor`) now works with the
 >   Hadamard-folded Bonsai models (per-weight sign vectors, `src/llama-model.cpp`; greedy output identical to a single
->   process), but over Wi-Fi it is slower than one phone (0.49 tok/s): it needs a low-latency link. Known issue: a
+>   process). Over Wi-Fi it reaches ~0.67 tok/s (rpc-servers with `OMP_WAIT_POLICY=active GOMP_SPINCOUNT=3000000`, and
+>   the all-reduce now adds small partials in host memory instead of launching a graph: +18%). The limit is Wi-Fi's
+>   cost per 20 KB exchange (~5-6 ms, the same with a 2 ms phone-to-phone link), ~128 per token; over Ethernet the
+>   estimate is ~1.4 tok/s, above one phone. `GGML_RPC_COMM_PROFILE=1` on the servers prints the per-sync breakdown. Known issue: a
 >   long-lived `ggml-rpc-server` keeps the GPU-assist/int2 copies of a disconnected client's weights; restart it
 >   before each new load.
 > - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`) and thread-0

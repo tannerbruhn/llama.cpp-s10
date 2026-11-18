@@ -2400,10 +2400,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const int64_t t2 = g_comm_profile.on ? ggml_time_us() : 0;
     // decode-sized f32 partials in host memory (CPU backend): add the peer's values in place instead of building
     // and launching a one-node graph on the backend's thread pool, which costs a thread wake-up per sync
-    // (~2 per layer per token with -sm tensor). Switch: GGML_RPC_HOST_REDUCE=1 (off by default until measured).
+    // (~2 per layer per token with -sm tensor). On by default (two S10s: +18%, steadier); GGML_RPC_HOST_REDUCE=0 turns
+    // it off.
     static const bool host_reduce = [] {
         const char * e = getenv("GGML_RPC_HOST_REDUCE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     if (host_reduce && !wire_bf16 && t_dst->type == GGML_TYPE_F32 && ggml_backend_buffer_is_host(t_dst->buffer) &&
             ggml_is_contiguous(t_dst)) {
