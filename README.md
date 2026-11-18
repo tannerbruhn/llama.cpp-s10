@@ -11,12 +11,19 @@
 > - A two-token IQ4_NL kernel that reads the weights once for 2-token batches (+21%; speculative-decoding checks),
 >   a faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
 > - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): +18% on code, +35% on edits.
-> - **Experimental: int2 CPU kernel** (`ggml/src/ggml-cpu/s10-int2.c`, `GGML_S10_INT2=all`): the CPU's share of each
+> - **int2 CPU kernel** (`ggml/src/ggml-cpu/s10-int2.c`, `GGML_S10_INT2=all`): the CPU's share of each
 >   PTQ1_0 matrix is re-encoded once in RAM as 2-bit codes and computed with a third fewer NEON instructions,
 >   bit-identical to the PTQ1_0 path (`tests/test-s10-int2.cpp`, greedy text and perplexity unchanged). Costs about
 >   +0.6 GB of RAM for the 27B; `GGML_S10_INT2_POOL=/dev/s10cpumem` can place the first part in otherwise unused
 >   memory (driver in the recipes repo). Bonsai 2 27B with the GPU assist at share 0.35: tg24 1.235 -> 1.34 tok/s;
->   long answers through the server 0.74 -> 1.03-1.17 tok/s (fewer heat pauses). Tested on one phone.
+>   long answers through the server 0.74 -> 1.03-1.17 tok/s (fewer heat pauses). In daily use on two phones since
+>   2026-11-17 (15 h of unattended serving without a restart on one of them).
+> - Experimental: two phones over llama.cpp RPC. Layer split (`--rpc`, `-ngl 32`): the 27B at 1.16 tok/s over
+>   Wi-Fi, both phones cool, ~4 GB free on the first. Tensor parallel (`-sm tensor`) now works with the
+>   Hadamard-folded Bonsai models (per-weight sign vectors, `src/llama-model.cpp`; greedy output identical to a single
+>   process), but over Wi-Fi it is slower than one phone (0.49 tok/s): it needs a low-latency link. Known issue: a
+>   long-lived `ggml-rpc-server` keeps the GPU-assist/int2 copies of a disconnected client's weights; restart it
+>   before each new load.
 > - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`) and thread-0
 >   placement (`GGML_S10_T0LAST`): about +2% and within noise, kept for further work.
 >

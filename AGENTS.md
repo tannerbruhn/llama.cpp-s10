@@ -10,7 +10,7 @@ code to upstream (ggml-org/llama.cpp or PrismML-Eng/llama.cpp): follow their CON
 - Mali GPU assist: `ggml/src/ggml-cpu/s10-gpu-assist.{c,h}`, CMake option `GGML_CPU_S10_GPU_ASSIST`; runtime
   switches are `GGML_S10_GPU_*` environment variables.
 - Router default model: `LLAMA_ROUTER_DEFAULT_MODEL` in `tools/server/server-models.cpp`.
-- int2 CPU kernel (experimental): `ggml/src/ggml-cpu/s10-int2.{c,h}`, kernels in `arch/arm/quants.c`
+- int2 CPU kernel: `ggml/src/ggml-cpu/s10-int2.{c,h}`, kernels in `arch/arm/quants.c`
   (`ggml_s10i2_*`), switches `GGML_S10_INT2*`; bit-identity test `tests/test-s10-int2.cpp`.
 - Recipes, server config and measured numbers: https://github.com/tannerbruhn/s10-llm-recipes
 
