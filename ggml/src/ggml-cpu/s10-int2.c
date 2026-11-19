@@ -367,6 +367,33 @@ void ggml_s10i2_chunk(const struct ggml_s10i2 * e, int n, const void * y, size_t
 #define S10I2_S(r) ((const ggml_half *) (e->scales + ((r) - e->row0) * (size_t) nb))
 
     const int64_t ncols = c1 - c0;
+    // 2-3 columns (speculative-decoding checks): pairs of columns with the 2x2 kernel, which unpacks each code block
+    // once for both; bit-identical to the per-column path. On by default (s10, 27B pp2 1.80 -> 1.85 tok/s);
+    // GGML_S10_INT2_C2=0 turns it off.
+    static int c2_on = -1;
+    if (c2_on < 0) {
+        c2_on = getenv("GGML_S10_INT2_C2") == NULL || atoi(getenv("GGML_S10_INT2_C2")) != 0;
+    }
+    if (c2_on && ncols >= 2 && ncols < 4) {
+        const void * ya = (const char *) y + c0 * y_stride;
+        const void * yb = (const char *) y + (c0 + 1) * y_stride;
+        float * da = (float *) ((char *) dst->data + c0 * dst->nb[1]);
+        float * db = (float *) ((char *) dst->data + (c0 + 1) * dst->nb[1]);
+        int64_t r = r0;
+        for (; r + 1 < r1; r += 2) {
+            float s[4];
+            ggml_vec_dot_s10i2_q8_0_x2c2(n, s, S10I2_C(r), S10I2_C(r + 1), S10I2_S(r), S10I2_S(r + 1), ya, yb, pf);
+            da[r] = s[0]; da[r + 1] = s[1];
+            db[r] = s[2]; db[r + 1] = s[3];
+        }
+        if (r < r1) {
+            float s[4];
+            ggml_vec_dot_s10i2_q8_0_x2c2(n, s, S10I2_C(r), S10I2_C(r), S10I2_S(r), S10I2_S(r), ya, yb, pf);
+            da[r] = s[0];
+            db[r] = s[2];
+        }
+        c0 += 2;   // a third column (if any) takes the per-column path below
+    }
     if (ncols < 4) {
         for (int64_t c = c0; c < c1; ++c) {
             const void * yc = (const char *) y + c * y_stride;

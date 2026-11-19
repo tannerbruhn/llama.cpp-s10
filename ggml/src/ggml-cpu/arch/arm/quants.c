@@ -389,6 +389,77 @@ void ggml_vec_dot_s10i2_q8_0_x2(int n, float * GGML_RESTRICT s,
 #endif
 }
 
+// Two s2 rows x two Q8_0 columns (2-token batches: speculative-decoding checks). Each code block is loaded and
+// unpacked once and used for both columns. Per (row, column) the integer sub-block sums, the dy * dx product, the fma
+// and the final vaddvq run exactly as in ggml_vec_dot_s10i2_q8_0_x2, so the results are bit-identical to calling it
+// once per column. s = { r0.yA, r1.yA, r0.yB, r1.yB }.
+void ggml_vec_dot_s10i2_q8_0_x2c2(int n, float * GGML_RESTRICT s,
+        const uint8_t * GGML_RESTRICT c0, const uint8_t * GGML_RESTRICT c1,
+        const ggml_half * GGML_RESTRICT d0, const ggml_half * GGML_RESTRICT d1,
+        const void * GGML_RESTRICT vya, const void * GGML_RESTRICT vyb, size_t prefetch) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    const int nb = n / QK_PTQ1_0;
+    const block_q8_0 * GGML_RESTRICT ya = vya;
+    const block_q8_0 * GGML_RESTRICT yb_ = vyb;
+    const uint8x16_t m = vdupq_n_u8(0xC0);
+    float32x4_t sa0 = vdupq_n_f32(0.0f), sa1 = vdupq_n_f32(0.0f), sb0 = vdupq_n_f32(0.0f), sb1 = vdupq_n_f32(0.0f);
+#define S2_P0(v) vreinterpretq_s8_u8(vshlq_n_u8((v), 6))
+#define S2_P1(v) vreinterpretq_s8_u8(vandq_u8(vshlq_n_u8((v), 4), m))
+#define S2_P2(v) vreinterpretq_s8_u8(vandq_u8(vshlq_n_u8((v), 2), m))
+#define S2_P3(v) vreinterpretq_s8_u8(vandq_u8((v), m))
+// one (row, column) pair of a half block: e0/e1 = the row's two unpacked parts for sub-blocks (k, k+1)
+#define S2_HALF(e00, e01, e10, e11, yq, k, P) do { \
+        const int8x16_t ya0 = vld1q_s8((yq)[k].qs), ya1 = vld1q_s8((yq)[k].qs + 16); \
+        const int8x16_t ya2 = vld1q_s8((yq)[(k) + 1].qs), ya3 = vld1q_s8((yq)[(k) + 1].qs + 16); \
+        int32x4_t a0 = vdotq_s32(vdupq_n_s32(0), e00, ya0); a0 = vdotq_s32(a0, e01, ya1); \
+        int32x4_t a1 = vdotq_s32(vdupq_n_s32(0), e10, ya2); a1 = vdotq_s32(a1, e11, ya3); \
+        P = vpaddq_s32(a0, a1); } while (0)
+#pragma GCC unroll 1
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_0 * yqa = &ya[4*i];
+        const block_q8_0 * yqb = &yb_[4*i];
+        uint16x4_t dha = vdup_n_u16(yqa[0].d);
+        dha = vld1_lane_u16(&yqa[1].d, dha, 1); dha = vld1_lane_u16(&yqa[2].d, dha, 2); dha = vld1_lane_u16(&yqa[3].d, dha, 3);
+        uint16x4_t dhb = vdup_n_u16(yqb[0].d);
+        dhb = vld1_lane_u16(&yqb[1].d, dhb, 1); dhb = vld1_lane_u16(&yqb[2].d, dhb, 2); dhb = vld1_lane_u16(&yqb[3].d, dhb, 3);
+        const float32x4_t dya = vcvt_f32_f16(vreinterpret_f16_u16(dha));
+        const float32x4_t dyb = vcvt_f32_f16(vreinterpret_f16_u16(dhb));
+        const uint8x16_t u00 = vld1q_u8(c0 + 32*i), u01 = vld1q_u8(c0 + 32*i + 16);
+        const uint8x16_t u10 = vld1q_u8(c1 + 32*i), u11 = vld1q_u8(c1 + 32*i + 16);
+        if (prefetch) { __builtin_prefetch(c0 + 32*i + prefetch, 0, 3); __builtin_prefetch(c1 + 32*i + prefetch, 0, 3); }
+        int32x4_t pa0a, pa1a, pb0a, pb1a, pa0b, pa1b, pb0b, pb1b;   // p{lo,hi}{row}{column}
+        {   // low half: parts 0 and 1, sub-blocks 0-1
+            const int8x16_t r0p0v0 = S2_P0(u00), r0p0v1 = S2_P0(u01), r0p1v0 = S2_P1(u00), r0p1v1 = S2_P1(u01);
+            const int8x16_t r1p0v0 = S2_P0(u10), r1p0v1 = S2_P0(u11), r1p1v0 = S2_P1(u10), r1p1v1 = S2_P1(u11);
+            S2_HALF(r0p0v0, r0p0v1, r0p1v0, r0p1v1, yqa, 0, pa0a); S2_HALF(r1p0v0, r1p0v1, r1p1v0, r1p1v1, yqa, 0, pa1a);
+            S2_HALF(r0p0v0, r0p0v1, r0p1v0, r0p1v1, yqb, 0, pa0b); S2_HALF(r1p0v0, r1p0v1, r1p1v0, r1p1v1, yqb, 0, pa1b);
+        }
+        {   // high half: parts 2 and 3, sub-blocks 2-3
+            const int8x16_t r0p2v0 = S2_P2(u00), r0p2v1 = S2_P2(u01), r0p3v0 = S2_P3(u00), r0p3v1 = S2_P3(u01);
+            const int8x16_t r1p2v0 = S2_P2(u10), r1p2v1 = S2_P2(u11), r1p3v0 = S2_P3(u10), r1p3v1 = S2_P3(u11);
+            S2_HALF(r0p2v0, r0p2v1, r0p3v0, r0p3v1, yqa, 2, pb0a); S2_HALF(r1p2v0, r1p2v1, r1p3v0, r1p3v1, yqa, 2, pb1a);
+            S2_HALF(r0p2v0, r0p2v1, r0p3v0, r0p3v1, yqb, 2, pb0b); S2_HALF(r1p2v0, r1p2v1, r1p3v0, r1p3v1, yqb, 2, pb1b);
+        }
+        const float dx0 = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(d0[i])), 0);
+        const float dx1 = (float) vget_lane_f16(vreinterpret_f16_u16(vdup_n_u16(d1[i])), 0);
+        sa0 = vfmaq_f32(sa0, vcvtq_n_f32_s32(vpaddq_s32(pa0a, pb0a), 6), vmulq_n_f32(dya, dx0));
+        sa1 = vfmaq_f32(sa1, vcvtq_n_f32_s32(vpaddq_s32(pa1a, pb1a), 6), vmulq_n_f32(dya, dx1));
+        sb0 = vfmaq_f32(sb0, vcvtq_n_f32_s32(vpaddq_s32(pa0b, pb0b), 6), vmulq_n_f32(dyb, dx0));
+        sb1 = vfmaq_f32(sb1, vcvtq_n_f32_s32(vpaddq_s32(pa1b, pb1b), 6), vmulq_n_f32(dyb, dx1));
+    }
+#undef S2_P0
+#undef S2_P1
+#undef S2_P2
+#undef S2_P3
+#undef S2_HALF
+    s[0] = vaddvq_f32(sa0); s[1] = vaddvq_f32(sa1); s[2] = vaddvq_f32(sb0); s[3] = vaddvq_f32(sb1);
+#else
+    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(c0); GGML_UNUSED(c1); GGML_UNUSED(d0); GGML_UNUSED(d1);
+    GGML_UNUSED(vya); GGML_UNUSED(vyb); GGML_UNUSED(prefetch);
+    GGML_ABORT("ggml_vec_dot_s10i2_q8_0_x2c2 needs dotprod");
+#endif
+}
+
 void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK_PQ2_0;
     const int nb = n / qk;

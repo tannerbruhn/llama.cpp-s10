@@ -1,4 +1,5 @@
-// S10 spec C: the s2 path must be bit-identical to the lean-v2 PTQ1_0 path.
+// S10 int2 CPU kernel: the s2 path must be bit-identical to the lean-v2 PTQ1_0 path, and the 2x2 (two-column)
+// kernel bit-identical to the 2-row kernel called once per column.
 //  (a) decode(encode(row)) == ggml_ptq1_0_decode_row_s10(row): bytes and scales
 //  (b) ggml_vec_dot_s10i2_q8_0_x2 floats == ggml_vec_dot_ptq1_0_q8_0_x2 floats, bit for bit
 // Random valid PTQ1_0 blocks use the codeword construction of the microbench (kernels/microbench/ptq1bench.c:886-887):
@@ -20,6 +21,8 @@ void ggml_s10i2_encode_row(int n, const void * ptq_row, uint8_t * codes, ggml_ha
 void ggml_s10i2_decode_row(int n, const uint8_t * codes, const ggml_half * scales, int8_t * q, float * d);
 void ggml_vec_dot_s10i2_q8_0_x2(int n, float * s, const uint8_t * c0, const uint8_t * c1,
                                 const ggml_half * d0, const ggml_half * d1, const void * vy, size_t prefetch);
+void ggml_vec_dot_s10i2_q8_0_x2c2(int n, float * s, const uint8_t * c0, const uint8_t * c1,
+                                  const ggml_half * d0, const ggml_half * d1, const void * vya, const void * vyb, size_t prefetch);
 }
 struct block_ptq1_0 { uint8_t qs[24]; uint8_t qh[2]; uint16_t d; };
 struct block_q8_0 { uint16_t d; int8_t qs[32]; };
@@ -72,6 +75,19 @@ int main() {
             ggml_vec_dot_s10i2_q8_0_x2(n, s_s2, &codes[0], &codes[nb * 32], &sc[0], &sc[nb], y.data(), rep & 1 ? 2 * nb * 32 : 0);
             if (memcmp(s_ref, s_s2, sizeof s_ref)) {
                 fprintf(stderr, "FAIL (b) n=%d rep=%d: %.9g %.9g vs %.9g %.9g\n", n, rep, s_ref[0], s_ref[1], s_s2[0], s_s2[1]);
+                fails++;
+            }
+            // (c) 2 rows x 2 columns in one pass == the 2-row kernel once per column
+            std::vector<float> x2(n); for (auto & v : x2) v = u(g);
+            std::vector<block_q8_0> y2(n / 32);
+            quantize_row_q8_0(x2.data(), y2.data(), n);
+            float s_b[2], s_c2[4];
+            ggml_vec_dot_s10i2_q8_0_x2(n, s_b, &codes[0], &codes[nb * 32], &sc[0], &sc[nb], y2.data(), 0);
+            ggml_vec_dot_s10i2_q8_0_x2c2(n, s_c2, &codes[0], &codes[nb * 32], &sc[0], &sc[nb], y.data(), y2.data(),
+                                          rep & 1 ? 2 * nb * 32 : 0);
+            if (memcmp(s_c2, s_s2, 2 * sizeof(float)) || memcmp(s_c2 + 2, s_b, 2 * sizeof(float))) {
+                fprintf(stderr, "FAIL (c) n=%d rep=%d: %.9g %.9g %.9g %.9g vs %.9g %.9g %.9g %.9g\n", n, rep,
+                        s_c2[0], s_c2[1], s_c2[2], s_c2[3], s_s2[0], s_s2[1], s_b[0], s_b[1]);
                 fails++;
             }
         }
