@@ -10,7 +10,23 @@
 >   of every PTQ1_0 matrix product over OpenCL (Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s generation.
 > - A two-token IQ4_NL kernel that reads the weights once for 2-token batches (+21%; speculative-decoding checks),
 >   a faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
-> - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): +18% on code, +35% on edits.
+> - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): code 3.31 -> 4.07 tok/s (+23%), edits
+>   3.32 -> 4.51 (+36%), prose 3.31 -> 3.46 (+4%). Model: [tanman24/Ornith-1.5-9B-S10-GGUF](https://huggingface.co/tanman24/Ornith-1.5-9B-S10-GGUF).
+> - **Ternary Bonsai 2 27B with MTP on one phone** (new, 2026-11-19): Qwen3.8-27B's MTP head grafted onto Bonsai
+>   ([tanman24/Bonsai-2-27B-S10-GGUF](https://huggingface.co/tanman24/Bonsai-2-27B-S10-GGUF)), MTP-1:
+>   prose 1.46, code 1.51, edits 1.64 tok/s (no MTP: ~1.3 / 1.3 / 1.2) at 4096 context with an 8-bit KV cache.
+>   What makes it fit in 8 GB and pay off:
+>   - **Rollback by replay on the CPU** (`src/llama-memory-recurrent.cpp`, on by default, `LLAMA_GDN_REPLAY=0` turns it
+>     off): a rejected guess is undone by re-applying the kept token's small update records instead of keeping a full
+>     snapshot of every linear-attention state. The records now sit in their own small tensor: -140 MB for the 27B,
+>     -116 MB for Ornith (3 guesses per round), and faster (Ornith prose with MTP 3.26 -> 3.46 tok/s).
+>   - **2-token kernels** for the check pass: int2 CPU 2x2 (`GGML_S10_INT2_C2`, default on) and a 2-column GPU-assist
+>     kernel (`GGML_S10_GPU_MM2`, default on); a 2-token batch 1.79 -> 1.92 tok/s, bit-identical results.
+>   - **`GGML_S10_MLOCK_SMALL=1`** locks the small file-backed weights (needs `LimitMEMLOCK`/`ulimit -l`; only acts
+>     on models with PTQ1_0 weights). Without it, the extra memory pressure of MTP made the kernel evict and
+>     re-read them from flash on every token (20-65k major faults per answer instead of a few hundred).
+>   - `S10_SPEC_PROFILE=1` prints where each speculative round's time goes (draft, check, rollback).
+>   Not yet over RPC: with layers on an RPC device the rollback falls back to snapshots.
 > - **int2 CPU kernel** (`ggml/src/ggml-cpu/s10-int2.c`, `GGML_S10_INT2=all`): the CPU's share of each
 >   PTQ1_0 matrix is re-encoded once in RAM as 2-bit codes and computed with a third fewer NEON instructions,
 >   bit-identical to the PTQ1_0 path (`tests/test-s10-int2.cpp`, greedy text and perplexity unchanged). Costs about
@@ -27,6 +43,8 @@
 >   estimate is ~1.4 tok/s, above one phone. `GGML_RPC_COMM_PROFILE=1` on the servers prints the per-sync breakdown. Known issue: a
 >   long-lived `ggml-rpc-server` keeps the GPU-assist/int2 copies of a disconnected client's weights; restart it
 >   before each new load.
+> - After any CPU/GPU kernel, clock or cooling change, re-sweep the GPU share `GGML_S10_GPU_FRAC` (AGENTS.md rule 7;
+>   currently 0.30).
 > - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`) and thread-0
 >   placement (`GGML_S10_T0LAST`): about +2% and within noise, kept for further work.
 >
