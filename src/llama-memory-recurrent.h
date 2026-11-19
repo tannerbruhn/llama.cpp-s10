@@ -71,7 +71,7 @@ public:
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
-    // (ARC-LAB: with rpl on, S has 2 groups only - base and record banks; r keeps 1 + n_rs_seq)
+    // (ARC-LAB: with rpl on, S has only the base group and separate record banks; r keeps 1 + n_rs_seq)
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
@@ -80,9 +80,9 @@ public:
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // ARC-LAB: rollback by replay for the gated delta net state (LLAMA_GDN_REPLAY, default on where it applies;
-    // independent implementation of the technique described by llamADALL). The S rows of plane 0 hold the base
-    // state; plane 1 of each cell holds two banks of per-token update records (ggml_gated_delta_net_replay). S is
-    // allocated with these 2 planes only (the snapshot path allocates 1 + n_rs_seq).
+    // independent implementation of the technique described by llamADALL). S holds only the base state; rec_l
+    // holds two banks of per-token update records per cell (ggml_gated_delta_net_replay). The snapshot path
+    // allocates 1 + n_rs_seq planes of S and no records tensor.
     // Rolling back r tokens drops the last r pending records instead of selecting a snapshot plane. The conv
     // state (r_l) keeps its snapshot planes and rs_idx.
     bool     rpl   = false;
@@ -125,6 +125,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> rec_l; // replay only: [rpl_R * n_rs_seq, 2 * size]
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -193,6 +194,7 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_rec_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;

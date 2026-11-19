@@ -54,8 +54,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                // r and s per layer, plus replay records and the separate PLE conv row where needed
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (rpl ? 1u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -75,8 +75,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // ARC-LAB: GDN rollback by replay (LLAMA_GDN_REPLAY=0 keeps the snapshot planes). Applies to a single sequence
     // of a qwen35 model whose recurrent layers all run on SYCL or the CPU; anything else keeps the snapshot path.
-    // Decided before the tensors are created: in replay mode S gets only planes 0 (base) and 1 (record banks), so
-    // planes 2..n_rs_seq are not allocated. The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
+    // Decided before the tensors are created: replay mode keeps only the base S plane and separate record banks.
+    // The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
     {
         const char * env = getenv("LLAMA_GDN_REPLAY");
         bool on = !(env && atoi(env) == 0) && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && offload &&
@@ -86,7 +86,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const uint32_t H = hparams.ssm_dt_rank;
         on = on && S == 128 && H > 0 && hparams.ssm_d_inner == S * H && hparams.n_embd_s() == S * S * H;
         const uint32_t R = H * (2 * S + 1);
-        // both banks of n_rs_seq records must fit in one S row
+        // keep the existing replay eligibility limit (both banks no larger than one S row)
         on = on && (uint64_t) 2 * n_rs_seq * R <= (uint64_t) hparams.n_embd_s();
         bool any = false;
         for (int i = 0; on && i < n_layer; i++) {
@@ -102,7 +102,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         rpl   = on && any;
         rpl_R = rpl ? R : 0;
         if (rpl) {
-            LLAMA_LOG_INFO("%s: GDN rollback by replay: on (%u records of %u floats per bank, S planes 2 of %u)\n", __func__,
+            LLAMA_LOG_INFO("%s: GDN rollback by replay: on (%u records of %u floats per bank, S planes 1 of %u, separate record banks)\n", __func__,
                     n_rs_seq, R, 1 + n_rs_seq);
         } else if (n_rs_seq > 0) {
             LLAMA_LOG_INFO("%s: GDN rollback by replay: off (snapshot planes)\n", __func__);
@@ -111,6 +111,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    rec_l.resize(n_layer);
     p_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
@@ -138,14 +139,20 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
 
         const uint32_t n_rows   = mem_size * (1 + n_rs_seq);
-        // ARC-LAB replay: S needs plane 0 (base) and plane 1 (record banks) only; the conv state keeps all its planes
-        const uint32_t n_rows_s = rpl ? mem_size * 2 : n_rows;
+        // ARC-LAB replay: S needs only the base plane; the conv state keeps all its planes
+        const uint32_t n_rows_s = rpl ? mem_size : n_rows;
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        if (rpl) {
+            ggml_tensor * rec = ggml_new_tensor_2d(ctx, type_s, (int64_t) rpl_R * n_rs_seq, 2 * (int64_t) mem_size);
+            ggml_format_name(rec, "cache_rec_l%d", i);
+            rec_l[i] = rec;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -853,6 +860,13 @@ size_t llama_memory_recurrent::size_s_bytes() const {
         }
     }
 
+    // Replay records are part of the S cache, in the same backend buffer.
+    for (const auto & rec : rec_l) {
+        if (rec != nullptr) {
+            size_s_bytes += ggml_nbytes(rec);
+        }
+    }
+
     return size_s_bytes;
 }
 
@@ -1128,9 +1142,9 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         io.write(&rpl_pending, sizeof(rpl_pending));
         io.write(&rpl_R,       sizeof(rpl_R));
         for (uint32_t il = 0; il < n_layer; ++il) {
-            if (s_l[il] == nullptr) continue;
-            const size_t off = ((size_t) (size + cell) * hparams.n_embd_s() + (size_t) rpl_bank_cur * n_rs_seq * rpl_R) * sizeof(float);
-            io.write_tensor(s_l[il], off, (size_t) rpl_pending * rpl_R * sizeof(float));
+            if (rec_l[il] == nullptr) continue;
+            const size_t off = (2 * (size_t) cell + rpl_bank_cur) * rec_l[il]->nb[1];
+            io.write_tensor(rec_l[il], off, (size_t) rpl_pending * rpl_R * sizeof(float));
         }
     }
 }
@@ -1383,8 +1397,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             return false;
         }
         for (uint32_t il = 0; il < n_layer; ++il) {
-            if (s_l[il] == nullptr) continue;
-            io.read_tensor(s_l[il], (size_t) (size + head) * hparams.n_embd_s() * sizeof(float), (size_t) n_rec * rpl_R * sizeof(float));
+            if (rec_l[il] == nullptr) continue;
+            io.read_tensor(rec_l[il], 2 * (size_t) head * rec_l[il]->nb[1], (size_t) n_rec * rpl_R * sizeof(float));
         }
         for (const llama_seq_id seq : cells[head].seq_id) {
             if (seq >= 0 && (size_t) seq < rpl_n.size()) {
@@ -1423,6 +1437,11 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
         if (s_l[il] != nullptr) {
             const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
+        }
+
+        if (rec_l[il] != nullptr) {
+            const size_t rec_size_cell = 2 * rec_l[il]->nb[1];
+            llama_clear_tensor_data(rec_l[il], cell_head * rec_size_cell, cell_count * rec_size_cell);
         }
 
         if (p_l[il] != nullptr) {
@@ -1506,6 +1525,10 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_rec_l(int32_t il) const {
+    return mem->rec_l[il];
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
