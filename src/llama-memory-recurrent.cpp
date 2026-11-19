@@ -74,7 +74,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     };
 
     // ARC-LAB: GDN rollback by replay (LLAMA_GDN_REPLAY=0 keeps the snapshot planes). Applies to a single sequence
-    // of a qwen35 model whose recurrent layers all run on SYCL; anything else silently keeps the snapshot path.
+    // of a qwen35 model whose recurrent layers all run on SYCL or the CPU; anything else keeps the snapshot path.
     // Decided before the tensors are created: in replay mode S gets only planes 0 (base) and 1 (record banks), so
     // planes 2..n_rs_seq are not allocated. The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
     {
@@ -96,7 +96,8 @@ llama_memory_recurrent::llama_memory_recurrent(
             any = true;
             ggml_backend_dev_t dev = model.dev_layer(i);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            on = reg && strcmp(ggml_backend_reg_name(reg), "SYCL") == 0;
+            // S10: the CPU backend has the replay op too (ggml_compute_forward_gated_delta_net_replay)
+            on = reg && (strcmp(ggml_backend_reg_name(reg), "SYCL") == 0 || strcmp(ggml_backend_reg_name(reg), "CPU") == 0);
         }
         rpl   = on && any;
         rpl_R = rpl ? R : 0;
