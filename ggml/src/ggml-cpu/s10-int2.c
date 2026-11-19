@@ -26,6 +26,7 @@ static char    g_sel[512];
 static int     g_sel_all;
 static int     g_check;
 static int     g_keep_pages;
+static int     g_thp;          // GGML_S10_INT2_THP=1: MADV_HUGEPAGE on the anonymous code buffers (needs a THP kernel)
 static long    g_max_mb;       // 0 = no cap
 static double  g_min_bytes;
 static int     g_pf_pairs;     // 0 = off, N = N row pairs ahead
@@ -66,7 +67,19 @@ static void * s10i2_alloc(size_t n) {
         fprintf(stderr, "s10-int2: pool exhausted, using anonymous memory\n");
     }
     void * p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
+    if (p == MAP_FAILED) {
+        return NULL;
+    }
+    if (g_thp) {
+        // before the first touch, so the conversion's page faults already get 2 MB pages; without THP in the
+        // kernel madvise fails with EINVAL and the buffer stays on 4 KB pages
+        static int logged;
+        if (madvise(p, n, MADV_HUGEPAGE) != 0 && !logged) {
+            logged = 1;
+            fprintf(stderr, "s10-int2: MADV_HUGEPAGE failed (kernel without transparent huge pages?), 4 KB pages\n");
+        }
+    }
+    return p;
 }
 
 static void s10i2_log_stats(void) {
@@ -156,6 +169,7 @@ static int s10i2_init(void) {
     g_sel_all = strcmp(g_sel, "all") == 0;
     g_check = getenv("GGML_S10_INT2_CHECK") != NULL;
     g_keep_pages = getenv("GGML_S10_INT2_KEEP_PAGES") != NULL;
+    g_thp = getenv("GGML_S10_INT2_THP") != NULL && atoi(getenv("GGML_S10_INT2_THP")) != 0;
     g_max_mb = getenv("GGML_S10_INT2_MAXMB") ? atol(getenv("GGML_S10_INT2_MAXMB")) : 0;
     g_min_bytes = getenv("GGML_S10_INT2_MINMB") ? atof(getenv("GGML_S10_INT2_MINMB")) * 1048576.0 : 6.0 * 1048576.0;
     {
