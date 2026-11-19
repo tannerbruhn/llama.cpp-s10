@@ -256,6 +256,25 @@ struct server_batch {
     }
 };
 
+// S10_SPEC_PROFILE=1: per-round time split for speculative decoding, printed every 32 target decodes:
+// draft (common_speculative_draft), decode (target llama_process + sync), process (common_speculative_process),
+// other (everything else between two target decodes: checkpoints, sampling, bookkeeping).
+struct s10_spec_profile {
+    bool    on = [] { const char * e = getenv("S10_SPEC_PROFILE"); return e != nullptr && atoi(e) != 0; }();
+    int64_t n = 0, t_draft = 0, t_decode = 0, t_process = 0, t_cycle = 0, t_last = 0;
+    void end_decode(int64_t now) {
+        if (t_last != 0) { t_cycle += now - t_last; }
+        t_last = now;
+        if (++n % 32 == 0) {
+            const double k = 32e3;
+            SRV_INF("[spec_profile] per target decode: draft %.1f ms, decode %.1f ms, process %.1f ms, other %.1f ms, cycle %.1f ms\n",
+                    t_draft / k, t_decode / k, t_process / k, (t_cycle - t_draft - t_decode - t_process) / k, t_cycle / k);
+            t_draft = t_decode = t_process = t_cycle = 0;
+        }
+    }
+};
+static s10_spec_profile g_spec_prof;
+
 struct server_slot {
     int id;
 
@@ -3846,9 +3865,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t0 = g_spec_prof.on ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (g_spec_prof.on) { g_spec_prof.t_draft += ggml_time_us() - t0; }
         }
 
         // make checkpoints if needed
@@ -4624,12 +4645,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_dec0 = g_spec_prof.on ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (g_spec_prof.on && has_output) {
+            const int64_t now = ggml_time_us();
+            g_spec_prof.t_decode += now - t_dec0;
+            g_spec_prof.end_decode(now);
+        }
 
         if (ret != 0) {
             {
@@ -4701,9 +4728,11 @@ private:
 
         if (spec_process) {
             bool ok = true;
+            const int64_t t0 = g_spec_prof.on ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (g_spec_prof.on) { g_spec_prof.t_process += ggml_time_us() - t0; }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

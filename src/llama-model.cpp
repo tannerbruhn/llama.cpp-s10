@@ -1,5 +1,10 @@
 #include "llama-model.h"
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -2093,6 +2098,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+#if defined(__linux__)
+    // S10 (GGML_S10_MLOCK_SMALL=1): lock the weights that stay file-backed - every tensor that is not PTQ1_0 and every
+    // PTQ1_0 tensor below GGML_S10_MLOCK_MINMB (default 6, the int2/GPU-assist threshold); the big PTQ1_0 matrices move
+    // into int2 codes / the GPU and their file pages are dropped. Under memory pressure (speculative decoding on one
+    // phone) the kernel otherwise evicts these small tensors and rereads them from flash on every use.
+    if (const char * e = getenv("GGML_S10_MLOCK_SMALL"); e && atoi(e) != 0 && use_mmap_buffer) {
+        const char * m = getenv("GGML_S10_MLOCK_MINMB");
+        const size_t min_bytes = (size_t) ((m ? atof(m) : 6.0) * 1048576.0);
+        const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+        size_t locked = 0, failed = 0, n = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            if (t->type == GGML_TYPE_PTQ1_0 && nb >= min_bytes) {
+                continue;
+            }
+            const uintptr_t a0 = (uintptr_t) t->data / pg * pg;
+            const uintptr_t a1 = ((uintptr_t) t->data + nb + pg - 1) / pg * pg;
+            if (mlock((void *) a0, a1 - a0) == 0) { locked += a1 - a0; n++; } else { failed += a1 - a0; }
+        }
+        LLAMA_LOG_INFO("%s: S10 mlock of file-backed small weights: %zu tensors, %.1f MiB locked, %.1f MiB failed%s\n",
+                __func__, n, locked / 1048576.0, failed / 1048576.0, failed ? " (raise LimitMEMLOCK / ulimit -l)" : "");
+    }
+#endif
 
     return true;
 }
