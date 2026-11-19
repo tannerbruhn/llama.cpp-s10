@@ -43,3 +43,7 @@ The GPU assist needs Mesa Rusticl on Panfrost (with the Bifrost int8-dot patch f
 5. **Heat:** never disable the phone's thermal guard to get a number. GPU clocks only from Samsung's DVFS table
    (156-702 MHz); other rates are rejected by the firmware.
 6. Commit as `tannerbruhn <tannerbruhn@users.noreply.github.com>`, without co-author or tool trailers.
+7. **Rebalance the GPU share after anything that shifts the CPU/GPU speed ratio**: a CPU or GPU kernel change, CPU
+   clock caps, the GPU clock, cooling. Sweep `GGML_S10_GPU_FRAC` (the recipes repo has the sweep script) and update the
+   presets on every phone; the phones log a warning at server start when the build or clocks differ from what the
+   share was tuned for. Not needed for memory/config, speculative decoding or networking changes.
