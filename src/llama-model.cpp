@@ -2104,7 +2104,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // PTQ1_0 tensor below GGML_S10_MLOCK_MINMB (default 6, the int2/GPU-assist threshold); the big PTQ1_0 matrices move
     // into int2 codes / the GPU and their file pages are dropped. Under memory pressure (speculative decoding on one
     // phone) the kernel otherwise evicts these small tensors and rereads them from flash on every use.
-    if (const char * e = getenv("GGML_S10_MLOCK_SMALL"); e && atoi(e) != 0 && use_mmap_buffer) {
+    // Only for models with PTQ1_0 weights: elsewhere (an IQ4/Q4 model) "not PTQ1_0" would mean the whole model, so a
+    // unit-wide setting stays safe for every preset of the router.
+    bool has_ptq1 = false;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t && t->type == GGML_TYPE_PTQ1_0) { has_ptq1 = true; break; }
+    }
+    if (const char * e = getenv("GGML_S10_MLOCK_SMALL"); e && atoi(e) != 0 && use_mmap_buffer && has_ptq1) {
         const char * m = getenv("GGML_S10_MLOCK_MINMB");
         const size_t min_bytes = (size_t) ((m ? atof(m) : 6.0) * 1048576.0);
         const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
