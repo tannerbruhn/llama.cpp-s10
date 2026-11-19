@@ -450,6 +450,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    static const std::regex pattern_rec_cache       ("cache_rec_l\\d*"); // S10: GDN replay records
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -601,7 +602,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache) ||
+                std::regex_match(tensor_name, pattern_rec_cache)) {
             if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE) {
                 // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
@@ -707,6 +709,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (std::regex_match(tensor_name, pattern_s_cache)) {
                     return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
                 }
+                if (std::regex_match(tensor_name, pattern_rec_cache)) {
+                    // S10: GDN replay records, K-1 records of [delta: S_v*H_v | k: S_v*H_v | g: H_v], all indexed by
+                    // V head like the S cache: per record one segment for delta+k and one for g, so every device keeps
+                    // whole records of exactly its own heads (2 segments per record, at most 8 records)
+                    const int64_t R = n_v_heads * (2 * head_v_dim + 1);
+                    GGML_ASSERT(tensor->ne[axis] % R == 0 && 2 * (tensor->ne[axis] / R) <= 16);
+                    std::vector<std::pair<int64_t, uint32_t>> segs;
+                    for (int64_t ir = 0; ir < tensor->ne[axis] / R; ir++) {
+                        segs.push_back({n_k_heads * head_v_dim, uint32_t(2 * head_ratio)});
+                        segs.push_back({n_k_heads, uint32_t(head_ratio)});
+                    }
+                    return segs;
+                }
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
@@ -772,6 +787,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+            if (std::regex_match(tensor_name, pattern_rec_cache)) {
+                // delta+k segments in floats per head (like the qkv rows), g segments in heads (like ssm_dt)
+                std::vector<int64_t> g(segments.size());
+                for (size_t is = 0; is < segments.size(); is++) {
+                    g[is] = is % 2 == 0 ? granularity_qkv : granularity_qkv / head_dim;
+                }
+                return g;
             }
         } else {
             // regular attention

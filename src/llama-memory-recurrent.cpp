@@ -74,7 +74,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     };
 
     // ARC-LAB: GDN rollback by replay (LLAMA_GDN_REPLAY=0 keeps the snapshot planes). Applies to a single sequence
-    // of a qwen35 model whose recurrent layers all run on SYCL or the CPU; anything else keeps the snapshot path.
+    // of a qwen35 model whose recurrent layers all run on SYCL or the CPU (RPC / tensor split with LLAMA_GDN_REPLAY=1);
+    // anything else keeps the snapshot path.
     // Decided before the tensors are created: replay mode keeps only the base S plane and separate record banks.
     // The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
     {
@@ -96,8 +97,13 @@ llama_memory_recurrent::llama_memory_recurrent(
             any = true;
             ggml_backend_dev_t dev = model.dev_layer(i);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            // S10: the CPU backend has the replay op too (ggml_compute_forward_gated_delta_net_replay)
-            on = reg && (strcmp(ggml_backend_reg_name(reg), "SYCL") == 0 || strcmp(ggml_backend_reg_name(reg), "CPU") == 0);
+            const char * rname = reg ? ggml_backend_reg_name(reg) : "";
+            // S10: the CPU backend has the replay op too (ggml_compute_forward_gated_delta_net_replay). RPC devices
+            // and the tensor-split (meta) device only on request (LLAMA_GDN_REPLAY=1): the RPC client cannot ask the
+            // server whether its backend has the op, so this is for RPC servers that run the CPU backend (phones).
+            const bool rpc_ok = env && atoi(env) == 1 &&
+                    ((dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) || strcmp(rname, "RPC") == 0);
+            on = strcmp(rname, "SYCL") == 0 || strcmp(rname, "CPU") == 0 || rpc_ok;
         }
         rpl   = on && any;
         rpl_R = rpl ? R : 0;

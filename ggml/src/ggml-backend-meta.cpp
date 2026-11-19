@@ -685,7 +685,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (tensor->src[0]->op == GGML_OP_GATED_DELTA_NET && tensor->view_offs == 0 &&
+        if ((tensor->src[0]->op == GGML_OP_GATED_DELTA_NET || tensor->src[0]->op == GGML_OP_GATED_DELTA_NET_REPLAY) &&
+                tensor->view_offs == 0 &&
                 src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             const ggml_tensor * q = tensor->src[0]->src[0];
             const ggml_tensor * v = tensor->src[0]->src[2];
@@ -849,6 +850,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // state shape is [S_v, S_v, H_v, n_seqs] (s0 only); the heads dim is its own axis 2,
         // so a head-aligned split on the input cache lands on axis 2 here.
         GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+    };
+
+    // S10: GDN rollback by replay. Same head split as the GDN op; the records (src 6) are split by head per record
+    // (cache_rec_l segments), the control pair (src 7) is mirrored. The packed output [attn | base | records] scales
+    // with the number of local heads in every part, so it is split along axis 0 like the GDN output.
+    auto handle_gated_delta_net_replay = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        bool all_mirrored = true;
+        for (int i = 0; i < 7; i++) {
+            all_mirrored = all_mirrored && src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        }
+        if (all_mirrored) {
+            return src_ss[0];
+        }
+        for (int i = 0; i < 5; i++) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_NONE);
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
@@ -1061,6 +1082,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_GATED_DELTA_NET_REPLAY: {
+                split_state = handle_gated_delta_net_replay(src_ss);
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
