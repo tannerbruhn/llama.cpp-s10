@@ -29,7 +29,12 @@ int  s10d_add(enum s10d_kernel k, const struct s10d_buf * w, const struct s10d_b
               const struct s10d_buf * y, const struct s10d_buf * as, int nb, int nr, int wg, int local_bytes,
               int groups_x, int groups_y, int group_base, int col_base);
 int  s10d_submit(void);   // chain + cache-flush job -> one DRM_IOCTL_PANFROST_SUBMIT; 1 = ok
-int  s10d_wait(void);     // spin until the submitted chain's results are in memory; 1 = ok
+int  s10d_wait(void);     // spin until the last submitted chain's results are in memory; 1 = ok
+// Ticket of the chain just submitted: wait for that chain only (chains run in submit order), so a caller can use the
+// first chain's results while a later one (e.g. the gate/up partner) still runs. Valid until 8 more chains.
+typedef const volatile uint32_t * s10d_ticket;
+s10d_ticket s10d_last_ticket(void);
+int  s10d_wait_ticket(s10d_ticket t);
 int  s10d_pending(void);  // a submitted chain has not been waited for yet
 
 #ifdef __cplusplus

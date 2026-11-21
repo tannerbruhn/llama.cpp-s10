@@ -1668,8 +1668,16 @@ UseGgmlGemm2:;
     }
 
 #ifdef GGML_S10_GPU_ASSIST
-    if (ith == 0 && ir0_base > 0) {
-        ggml_s10ga_end(dst, ir0_base);
+    if (ir0_base > 0) {
+        if (ggml_s10ga_parallel_copy(dst)) {         // same answer on every thread: all take the barrier
+            if (ith == 0) {
+                ggml_s10ga_end_wait(dst, ir0_base);
+            }
+            ggml_barrier(params->threadpool);
+            ggml_s10ga_copy_part(dst, ir0_base, ith, nth);
+        } else if (ith == 0) {
+            ggml_s10ga_end(dst, ir0_base);
+        }
     }
 #endif
 }

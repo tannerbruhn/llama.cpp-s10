@@ -19,6 +19,10 @@ void ggml_s10ga_submit(void);
 
 // Thread 0 only, after its CPU chunks. Waits for the GPU and writes its rows into dst.
 void ggml_s10ga_end(struct ggml_tensor * dst, int64_t rows);
+// direct path, prompt-sized calls: thread 0 waits (end_wait), barrier, then every thread copies its columns
+int  ggml_s10ga_parallel_copy(const struct ggml_tensor * dst);
+void ggml_s10ga_end_wait(struct ggml_tensor * dst, int64_t R);
+void ggml_s10ga_copy_part(struct ggml_tensor * dst, int64_t R, int ith, int nth);
 
 #ifdef __cplusplus
 }

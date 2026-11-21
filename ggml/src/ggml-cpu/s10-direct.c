@@ -226,6 +226,20 @@ int s10d_submit(void) {
 
 int s10d_pending(void) { return s10d_inflight; }
 
+s10d_ticket s10d_last_ticket(void) { return s10d_flush_status; }
+
+int s10d_wait_ticket(s10d_ticket t) {
+    if (!t) return 1;
+    if (t == s10d_flush_status) return s10d_wait();
+    const double lim = s10d_now() + 2.0;
+    uint32_t st;
+    while ((st = t[0]) == 0) {
+        if (s10d_now() > lim) return s10d_wait() && t[0] == 1;   // fence of the last chain covers the earlier ones
+    }
+    if (st != 1) { fprintf(stderr, "s10-direct: chain ended with status 0x%x\n", st); return 0; }
+    return 1;
+}
+
 int s10d_wait(void) {
     if (s10d_njobs && !s10d_submit()) return 0;                // queued dispatches not submitted yet
     if (!s10d_inflight) return 1;
