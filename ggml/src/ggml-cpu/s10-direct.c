@@ -26,18 +26,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#define S10D_MAX_JOBS   48          // dispatches per chain (output head at a large share needs a few)
+#define S10D_MAX_JOBS   16          // dispatches per chain; a full chain is submitted and the next page started, so a
+                                    // long prompt is several short submits (Panfrost's job timeout is per chain)
 #define S10D_SLOT       0x200       // descriptor bytes per dispatch
-#define S10D_PAGES      2           // alternate descriptor pages between consecutive submits
+#define S10D_PAGES      8           // ring of descriptor pages; chains run in submit order, a page is reused only
+                                    // after its own chain's flush job reported done
 #define S10D_MAX_BOS    64
 
 static int      s10d_fd = -1;
 static struct s10d_buf s10d_sh[S10D_NKERNELS], s10d_state, s10d_wls, s10d_tls, s10d_desc[S10D_PAGES];
 static uint32_t s10d_sync;
 static unsigned s10d_cores;         // max shader core id + 1 (WLS is per core)
-static int      s10d_page, s10d_njobs, s10d_inflight;
+static int      s10d_page = -1, s10d_njobs, s10d_inflight;   // inflight: a submitted chain not yet waited for
 static uint32_t s10d_bos[S10D_MAX_BOS]; static int s10d_nbos;
-static volatile uint32_t * s10d_flush_status;
+static volatile uint32_t * s10d_flush_status;                 // last submitted chain's flush job
+static volatile uint32_t * s10d_page_flush[S10D_PAGES];        // each page's last flush job (NULL = page free)
 
 static double s10d_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int64_t s10d_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t) t.tv_sec * 1000000000 + t.tv_nsec; }
@@ -57,8 +60,7 @@ int s10d_buf_alloc(struct s10d_buf * b, size_t size) {
     if (s10d_ioctl(DRM_IOCTL_PANFROST_MMAP_BO, &m)) goto fail;
     void * p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s10d_fd, (off_t) m.offset);
     if (p == MAP_FAILED) goto fail;
-    memset(p, 0, size);
-    *b = (struct s10d_buf) { c.handle, c.offset, p, size };
+    *b = (struct s10d_buf) { c.handle, c.offset, p, size };     // new GEM pages are zero-filled by the kernel
     return 1;
 fail: {
         struct drm_gem_close gc = { .handle = c.handle };
@@ -135,10 +137,15 @@ static void s10d_add_bo(uint32_t h) {
 int s10d_add(enum s10d_kernel k, const struct s10d_buf * w, const struct s10d_buf * qx, const struct s10d_buf * dx,
              const struct s10d_buf * y, const struct s10d_buf * as, int nb, int nr, int wg, int local_bytes,
              int groups_x, int groups_y, int group_base, int col_base) {
-    if (s10d_njobs >= S10D_MAX_JOBS || k < 0 || k >= S10D_NKERNELS || wg < 1 || groups_x < 1 || groups_y < 1) return 0;
+    if (k < 0 || k >= S10D_NKERNELS || wg < 1 || groups_x < 1 || groups_y < 1) return 0;
+    if (s10d_njobs == S10D_MAX_JOBS && !s10d_submit()) return 0;
     if (s10d_njobs == 0) {
-        if (s10d_inflight) s10d_wait();
-        s10d_page ^= 1;
+        s10d_page = (s10d_page + 1) % S10D_PAGES;
+        if (s10d_page_flush[s10d_page]) {                       // the page's previous chain must be finished
+            const double lim = s10d_now() + 2.0;
+            while (s10d_page_flush[s10d_page][0] == 0 && s10d_now() < lim) { }
+            s10d_page_flush[s10d_page] = NULL;
+        }
         s10d_nbos = 0;
         s10d_add_bo(s10d_desc[s10d_page].handle); s10d_add_bo(s10d_state.handle); s10d_add_bo(s10d_wls.handle);
         s10d_add_bo(s10d_tls.handle);
@@ -207,6 +214,7 @@ int s10d_submit(void) {
     w32(f + 36, 1u);                                                                  // L2 clean
     w64(d->cpu + (size_t) S10D_SLOT * (s10d_njobs - 1) + 0x140 + 24, fva);          // last compute job -> flush job
     s10d_flush_status = (volatile uint32_t *) f;
+    s10d_page_flush[s10d_page] = s10d_flush_status;
     __sync_synchronize();
     struct drm_panfrost_submit s = { .jc = d->va + 0x140, .out_sync = s10d_sync,
                                      .bo_handles = (uintptr_t) s10d_bos, .bo_handle_count = (uint32_t) s10d_nbos };
@@ -219,6 +227,7 @@ int s10d_submit(void) {
 int s10d_pending(void) { return s10d_inflight; }
 
 int s10d_wait(void) {
+    if (s10d_njobs && !s10d_submit()) return 0;                // queued dispatches not submitted yet
     if (!s10d_inflight) return 1;
     const double lim = s10d_now() + 2.0;
     uint32_t st;

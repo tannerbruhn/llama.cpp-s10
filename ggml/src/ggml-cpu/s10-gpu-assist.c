@@ -21,6 +21,8 @@
 #include <arm_neon.h>
 #endif
 
+#include "s10-direct.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +44,13 @@ struct s10ga_entry {
     int64_t      rows;   // 0 = assist not used for this tensor
     char         name[GGML_MAX_NAME];
     struct s10ga_entry * partner;   // ffn_gate -> its ffn_up (same input): both GPU shares go in one submit
+    struct s10d_buf dw;             // GGML_S10_GPU_DIRECT: the same rows in a Panfrost buffer (w stays NULL)
 };
+// GGML_S10_GPU_DIRECT=1: submit the kernels through s10-direct.c (Panfrost ioctls, pre-compiled shaders) instead of
+// Rusticl. Same kernels and geometry, bit-identical results, ~2x faster per call. Only the 8-row mv kernel and the
+// mm2/mm4 kernels are embedded: a tensor that would need the 4-row or tail kernel stays on the CPU.
+static int g_direct, g_d_mm2 = 1, g_d_mm4 = 1;
+static struct s10d_buf g_dqx, g_ddx, g_das, g_dy, g_dy2;
 
 // Fused gate+up (GGML_S10_GPU_FUSE=0 disables): the gate call also queues the up tensor's GPU rows, which
 // the following up call (same src1) then only collects.
@@ -135,6 +143,19 @@ static int s10ga_init(void) {
 #endif
     if (!(g_frac > 0.0f && g_frac < 1.0f)) {
         return 0;
+    }
+    g_direct = getenv("GGML_S10_GPU_DIRECT") && atoi(getenv("GGML_S10_GPU_DIRECT")) != 0;
+    if (g_direct) {
+        if (s10d_init()) {
+            g_xfer = 1; g_spin = 1; g_prof = 0;
+            g_d_mm4 = !(getenv("GGML_S10_GPU_MM4") && atoi(getenv("GGML_S10_GPU_MM4")) == 0);
+            g_d_mm2 = !(getenv("GGML_S10_GPU_MM2") && atoi(getenv("GGML_S10_GPU_MM2")) == 0);
+            fprintf(stderr, "s10-gpu-assist: direct submission (no Rusticl), GPU takes %.0f%% of each PTQ1_0 mat-mul's rows%s\n",
+                    g_frac * 100.0f, g_check ? " (checking results)" : "");
+            return 1;
+        }
+        fprintf(stderr, "s10-gpu-assist: direct submission unavailable, using Rusticl\n");
+        g_direct = 0;
     }
 
     // The OpenCL driver's worker threads inherit this thread's CPU mask. Create them on the cores in
@@ -261,6 +282,23 @@ static struct s10ga_entry * s10ga_lookup(const struct ggml_tensor * src0) {
                 return e;
             }
             const size_t bytes = (size_t) rows * nb * 34;
+            if (g_direct) {
+                // the direct path embeds only the 8-row mv kernel (s10ga_enqueue_mv picks 4 rows for a K tail or for
+                // long K with many rows) and mm2/mm4 (no K tail)
+                if (nb % 4 != 0 || (nb >= 128 && rows >= 4096)) {
+                    fprintf(stderr, "s10-gpu-assist: %s needs the 4-row kernel (not in the direct path), CPU only\n", src0->name);
+                    return e;
+                }
+                uint8_t * tmp = malloc(bytes);
+                if (!tmp || !s10d_buf_alloc(&e->dw, bytes)) {
+                    free(tmp);
+                    fprintf(stderr, "s10-gpu-assist: %s: GPU buffer of %zu bytes failed, CPU only\n", src0->name, bytes);
+                    return e;
+                }
+                s10ga_encode((const uint8_t *) src0->data, rows, nb, tmp);   // encode in RAM, one streaming copy into WC memory
+                memcpy(e->dw.cpu, tmp, bytes);
+                free(tmp);
+            } else {
             cl_int err;
             cl_mem w = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, bytes, NULL, &err);
             if (err != CL_SUCCESS) {
@@ -276,6 +314,7 @@ static struct s10ga_entry * s10ga_lookup(const struct ggml_tensor * src0) {
             clEnqueueUnmapMemObject(g_q, w, p, 0, NULL, NULL);
             clFinish(g_q);
             e->w    = w;
+            }
             e->rows = rows;
             g_gpu_bytes += bytes;
             // pair ffn_up and ffn_gate of the same layer: the one met first in the graph (llama.cpp computes
@@ -486,7 +525,99 @@ static void s10ga_quant128_neon(const float * x, int64_t nb, int8_t * qx, float 
 }
 #endif
 
+// Direct path: the same dispatch geometry as s10ga_enqueue_mmc / s10ga_enqueue_mv, queued with s10d_add.
+static int64_t s10ga_direct_mmc(struct s10ga_entry * e, enum s10d_kernel k, int mmc, int nbi, int Ri, int lanes,
+                                int64_t ncols, const struct s10d_buf * out) {
+    const int64_t R = e->rows;
+    const int s4 = (R % 8 == 0) ? 2 : 1, tr4 = 4 * s4, wg4 = lanes * s4;
+    const int64_t rl4 = S10GA_MAX_ROWS / mmc / tr4 * tr4;
+    const int64_t rp4 = R < rl4 ? R : (rl4 > 0 ? rl4 : tr4);
+    int64_t qp4 = S10GA_MAX_ROWS / mmc / rp4;
+    if (qp4 < 1) qp4 = 1;
+    const int64_t nq = ncols / mmc;
+    for (int64_t q0 = 0; q0 < nq; q0 += qp4) {
+        const int64_t nqq = nq - q0 < qp4 ? nq - q0 : qp4;
+        for (int64_t r0 = 0; r0 < R; r0 += rp4) {
+            const int64_t nr = R - r0 < rp4 ? R - r0 : rp4;
+            if (!s10d_add(k, &e->dw, &g_dqx, &g_ddx, out, &g_das, nbi, Ri, wg4, wg4 * 4 * mmc * (int) sizeof(float),
+                          (int) (nr / tr4), (int) nqq, (int) (r0 / tr4), (int) (q0 * mmc))) {
+                GGML_ABORT("s10-gpu-assist: direct mm%d dispatch failed", mmc);
+            }
+        }
+    }
+    return nq * mmc;
+}
+
+static void s10ga_direct_mv(struct s10ga_entry * e, int64_t nb, int64_t ncols, const struct s10d_buf * out) {
+    const int64_t R = e->rows;
+    const int nbi = (int) nb, Ri = (int) R, lanes = S10GA_LANES;
+    const int tile = 8;                      // lookup keeps tensors that need the 4-row kernel off the direct path
+    int slots = g_slots ? g_slots : (R >= 4096 ? 4 : 1);
+    if (R % (tile * slots) != 0) slots = 1;
+    const int tile_rows = tile * slots, wg = lanes * slots;
+    int64_t col0 = 0;
+    if (g_d_mm4 && ncols >= 4) {
+        col0 = s10ga_direct_mmc(e, S10D_MM4, 4, nbi, Ri, lanes, ncols, out);
+    } else if (g_d_mm2 && ncols >= 2) {
+        col0 = s10ga_direct_mmc(e, S10D_MM2, 2, nbi, Ri, lanes, ncols, out);
+    }
+    if (col0 == ncols) {
+        return;
+    }
+    const int64_t row_limit = S10GA_MAX_ROWS / tile_rows * tile_rows;
+    const int64_t rows_per = R < row_limit ? R : row_limit;
+    int64_t cols_per = S10GA_MAX_ROWS / rows_per;
+    if (cols_per < 1) cols_per = 1;
+    for (int64_t c0 = col0; c0 < ncols; c0 += cols_per) {
+        const int64_t nc = ncols - c0 < cols_per ? ncols - c0 : cols_per;
+        for (int64_t r0 = 0; r0 < R; r0 += rows_per) {
+            const int64_t nr = R - r0 < rows_per ? R - r0 : rows_per;
+            if (!s10d_add(S10D_MV8, &e->dw, &g_dqx, &g_ddx, out, &g_das, nbi, Ri, wg, wg * tile * (int) sizeof(float),
+                          (int) (nr / tile_rows), (int) nc, (int) (r0 / tile_rows), (int) c0)) {
+                GGML_ABORT("s10-gpu-assist: direct mv dispatch failed");
+            }
+        }
+    }
+}
+
+static int64_t s10ga_submit_direct(struct s10ga_entry * e, const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+    const int64_t K = src0->ne[0], nb = K / 128, R = e->rows, ncols = src1->ne[1];
+    if (s10d_pending() && !s10d_wait()) {    // the inputs below are shared with any chain still running
+        GGML_ABORT("s10-gpu-assist: direct GPU job failed");
+    }
+    int8_t * qx = g_hqx = s10ga_host(g_hqx, &g_hcap_qx, (size_t) ncols * K);
+    float  * dx = g_hdx = s10ga_host(g_hdx, &g_hcap_dx, (size_t) ncols * nb * sizeof(float));
+    g_has = s10ga_host(g_has, &g_hcap_as, (size_t) ncols * nb * sizeof(int32_t));
+    for (int64_t c = 0; c < ncols; c++) {
+        const float * x = (const float *) ((const char *) src1->data + c * src1->nb[1]);
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (g_qneon) {
+            s10ga_quant128_neon(x, nb, qx + c * K, dx + c * nb, g_has + c * nb);
+        } else
+#endif
+        {
+            s10ga_quant128_scalar(x, nb, qx + c * K, dx + c * nb, g_has + c * nb);
+        }
+    }
+    memcpy(g_dqx.cpu, qx, (size_t) ncols * K);
+    memcpy(g_ddx.cpu, dx, (size_t) ncols * nb * sizeof(float));
+    memcpy(g_das.cpu, g_has, (size_t) ncols * nb * sizeof(int32_t));
+    s10ga_direct_mv(e, nb, ncols, &g_dy);
+    if (g_fuse && e->partner && e->partner->rows > 0 &&
+        s10d_buf_reserve(&g_dy2, (size_t) ncols * e->partner->rows * sizeof(float))) {
+        s10ga_direct_mv(e->partner, nb, ncols, &g_dy2);   // same activations: the partner's rows go in the same chain
+        g_pend = e->partner; g_pend_x = src1->data; g_pend_ncols = ncols;
+    }
+    if (!s10d_submit()) {
+        GGML_ABORT("s10-gpu-assist: direct submit failed");
+    }
+    return R;
+}
+
 static int64_t s10ga_submit_impl(struct s10ga_entry * e, const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+    if (g_direct) {
+        return s10ga_submit_direct(e, src0, src1);
+    }
     const int64_t K = src0->ne[0], nb = K / 128, R = e->rows, ncols = src1->ne[1];
     cl_int err;
     const double t0 = s10ga_now();
@@ -612,10 +743,22 @@ int64_t ggml_s10ga_begin(const struct ggml_tensor * src0, const struct ggml_tens
         }
         g_n_dropped++;
         if (getenv("GGML_S10_GPU_FUSEDBG") && g_n_dropped < 5) fprintf(stderr, "s10-gpu-assist fuse drop: pending %s x=%p n=%lld, got %s x=%p n=%lld\n", g_pend->name, g_pend_x, (long long) g_pend_ncols, e->name, src1->data, (long long) ncols);
+        if (g_direct) {
+            s10d_wait();                      // not consumed: let it finish and drop it
+        } else {
         clWaitForEvents(1, &g_pend_rev);  // not consumed: let it finish and drop it
         clReleaseEvent(g_pend_kev); clReleaseEvent(g_pend_rev);
+        }
         g_pend = NULL;
     }
+    if (g_direct) {
+        if (!s10d_buf_reserve(&g_dqx, (size_t) ncols * K) ||
+            !s10d_buf_reserve(&g_ddx, (size_t) ncols * nb * sizeof(float)) ||
+            !s10d_buf_reserve(&g_das, (size_t) ncols * nb * sizeof(int32_t)) ||
+            !s10d_buf_reserve(&g_dy,  (size_t) ncols * R * sizeof(float))) {
+            return 0;
+        }
+    } else
     if (!s10ga_reserve(&g_bqx, &g_cap_qx, (size_t) ncols * K) ||
         !s10ga_reserve(&g_bdx, &g_cap_dx, (size_t) ncols * nb * sizeof(float)) ||
         !s10ga_reserve(&g_bas, &g_cap_as, (size_t) ncols * nb * sizeof(int32_t)) ||
@@ -679,6 +822,25 @@ void ggml_s10ga_end(struct ggml_tensor * dst, int64_t R) {
         return;
     }
     const int64_t ncols = dst->ne[1];
+    if (g_direct) {
+        const uint8_t * y;
+        if (g_cur_is_pend) {                 // computed in the previous call's chain, which its end() waited for
+            y = g_dy2.cpu;
+            g_pend = NULL; g_cur_is_pend = 0;
+        } else {
+            if (!s10d_wait()) {
+                GGML_ABORT("s10-gpu-assist: direct GPU job failed");
+            }
+            y = g_dy.cpu;
+        }
+        for (int64_t c = 0; c < ncols; c++) {
+            memcpy((char *) dst->data + c * dst->nb[1], y + (size_t) c * R * sizeof(float), R * sizeof(float));
+        }
+        if (g_check) {
+            s10ga_check(dst, R);
+        }
+        return;
+    }
     cl_int err;
     if (g_cur_is_pend) {
         cl_int st = CL_QUEUED;
