@@ -432,3 +432,31 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+if (GGML_RPC AND LLAMA_BUILD_TOOLS AND UNIX AND NOT GGML_BACKEND_DL)
+    add_executable(test-rpc-multi-server ${PROJECT_SOURCE_DIR}/tests/test-rpc-multi-server.cpp)
+    target_link_libraries(test-rpc-multi-server PRIVATE ggml ggml-rpc)
+    target_include_directories(test-rpc-multi-server PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(
+        NAME test-rpc-multi-server
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-multi-server.sh
+            $<TARGET_FILE:ggml-rpc-server>
+            $<TARGET_FILE:test-rpc-multi-server>)
+    set_property(TEST test-rpc-multi-server PROPERTY LABELS main)
+    add_executable(test-rpc-auth
+        test-rpc-auth.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc/auth.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc/log.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc/transport.cpp)
+    target_include_directories(test-rpc-auth PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_features(test-rpc-auth PRIVATE cxx_std_17)
+    target_link_libraries(test-rpc-auth PRIVATE ggml)
+    add_test(NAME test-rpc-auth COMMAND test-rpc-auth)
+    add_executable(test-rpc-auth-client test-rpc-auth-client.cpp)
+    target_link_libraries(test-rpc-auth-client PRIVATE ggml ggml-rpc)
+    add_test(NAME test-rpc-auth-e2e
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-rpc-auth.sh
+            $<TARGET_FILE:ggml-rpc-server> $<TARGET_FILE:test-rpc-auth-client>
+            $<TARGET_FILE:test-rpc-multi-server> ${CMAKE_CURRENT_SOURCE_DIR}/test-rpc-multi-server.sh)
+    set_tests_properties(test-rpc-multi-server test-rpc-auth-e2e PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+endif()

@@ -1,3 +1,4 @@
+#include "auth.h"
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -645,11 +646,13 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
+    rpc_auth_key key;
+    if (!key.load()) { GGML_ABORT("RPC key configuration failed\n"); }
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!rpc_authenticate(*sock, key, false) || !negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1387,8 +1390,9 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir,
+               const std::string & host, const rpc_auth_key & key)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), bind_host(host), auth_key(key) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
     }
@@ -1445,6 +1449,8 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    const std::string bind_host;
+    const rpc_auth_key & auth_key;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -2234,7 +2240,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     uint8_t local_caps[RPC_CONN_CAPS_SIZE] = {};
     uint8_t remote_caps[RPC_CONN_CAPS_SIZE] = {};
     if (request.rank == 0) {
-        socket_ptr srv = socket_t::create_server("0.0.0.0", request.port);
+        socket_ptr srv = socket_t::create_server(bind_host.c_str(), request.port);
         if (srv == nullptr) {
             LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, request.port);
             return true;
@@ -2243,7 +2249,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         if (state.peer == nullptr) {
             return true;
         }
-        if (!state.peer->recv_data(remote_caps, sizeof(remote_caps))) {
+        if (!rpc_authenticate(*state.peer, auth_key, true) ||
+            !state.peer->recv_data(remote_caps, sizeof(remote_caps))) {
             state.peer = nullptr;
             return true;
         }
@@ -2264,6 +2271,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         if (state.peer == nullptr) {
             LOG_ERROR("[%s] failed to connect to peer %s:%u\n", __func__, host.c_str(), request.port);
+            return true;
+        }
+        if (!rpc_authenticate(*state.peer, auth_key, false)) {
+            state.peer = nullptr;
             return true;
         }
         state.peer->get_caps(local_caps);
@@ -2482,8 +2493,9 @@ rpc_server::~rpc_server() {
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, const std::string & host, const rpc_auth_key & key) {
+    if (!rpc_authenticate(*sock, key, true)) { return; }
+    rpc_server server(backends, cache_dir, host, key);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2815,6 +2827,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
+    rpc_auth_key key;
+    if (!key.load()) { return; }
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
@@ -2871,7 +2885,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             return;
         }
         LOG_INFO("Accepted client connection\n");
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, client_socket, host, key);
         LOG_INFO("Client connection closed\n");
     }
     rpc_transport_shutdown();

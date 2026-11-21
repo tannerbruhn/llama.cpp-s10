@@ -7,7 +7,7 @@ port_a=$((40000 + $$ % 10000))
 port_b=$((port_a + 1))
 endpoint_a="127.0.0.1:${port_a}"
 endpoint_b="127.0.0.1:${port_b}"
-test_dir=$(mktemp -d)
+test_dir=$(mktemp -d "${TMPDIR:-$PWD}/rpc-multi.XXXXXX")
 
 cleanup() {
     kill "${pid_a:-}" "${pid_b:-}" 2>/dev/null || true

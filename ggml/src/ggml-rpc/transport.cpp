@@ -8,7 +8,9 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
+#  include <poll.h>
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
@@ -17,6 +19,8 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -810,5 +814,76 @@ void rpc_transport_shutdown() {
     }
     WSACleanup();
     g_rpc_transport_wsa_started = false;
+#endif
+}
+
+// This path is used only before HELLO; normal command I/O is unchanged.
+bool socket_t::auth_recv(void * data, size_t size) {
+#ifdef _WIN32
+    (void) data; (void) size;
+    return false;
+#else
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto * out = static_cast<uint8_t *>(data);
+    while (size) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) { return false; }
+        pollfd pfd = {pimpl->fd, POLLIN, 0};
+        int ready = poll(&pfd, 1, int(remaining));
+        if (ready < 0 && errno == EINTR) { continue; }
+        if (ready <= 0) { return false; }
+        ssize_t n = recv(pimpl->fd, out, size, 0);
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n <= 0) { return false; }
+        out += n; size -= size_t(n);
+    }
+    return true;
+#endif
+}
+
+std::string socket_t::peer_address() const {
+    sockaddr_storage addr = {};
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    char host[NI_MAXHOST], service[NI_MAXSERV];
+    if (getpeername(pimpl->fd, reinterpret_cast<sockaddr *>(&addr), &len) != 0 ||
+        getnameinfo(reinterpret_cast<sockaddr *>(&addr), len, host, sizeof(host), service, sizeof(service),
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        return "unknown peer";
+    }
+    return std::string(host) + ":" + service;
+}
+
+// Handshake writes must also survive a peer closing before reading its challenge.
+bool socket_t::auth_send(const void * data, size_t size) {
+#ifdef _WIN32
+    (void) data; (void) size;
+    return false;
+#else
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    int enabled = 1;
+    if (setsockopt(pimpl->fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) { return false; }
+#endif
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto * in = static_cast<const uint8_t *>(data);
+    while (size) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) { return false; }
+        pollfd pfd = {pimpl->fd, POLLOUT, 0};
+        int ready = poll(&pfd, 1, int(remaining));
+        if (ready < 0 && errno == EINTR) { continue; }
+        if (ready <= 0) { return false; }
+        ssize_t n = send(pimpl->fd, in, size, flags);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) { continue; }
+        if (n <= 0) { return false; }
+        in += n; size -= size_t(n);
+    }
+    return true;
 #endif
 }

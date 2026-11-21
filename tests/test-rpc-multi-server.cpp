@@ -62,6 +62,16 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(ggml_backend_buft_get_alloc_size(buft, packed)  >= ggml_nbytes(packed));
     GGML_ASSERT(ggml_backend_buft_get_alloc_size(buft, strided) >= ggml_nbytes(strided));
 
+    // Exercise the separately authenticated server-to-server connection.
+    auto reg = ggml_backend_rpc_reg();
+    auto comm_init = reinterpret_cast<ggml_backend_comm_init_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init"));
+    auto comm_free = reinterpret_cast<ggml_backend_comm_free_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free"));
+    GGML_ASSERT(comm_init && comm_free);
+    ggml_backend_t pair[] = {backend_a, backend_b};
+    void * comm = comm_init(pair, 2);
+    GGML_ASSERT(comm != nullptr);
+    comm_free(comm);
+
     ggml_free(ctx);
     ggml_backend_free(backend_b);
     ggml_backend_free(backend_a);

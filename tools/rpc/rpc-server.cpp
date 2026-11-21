@@ -107,6 +107,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+    fprintf(stderr, "  -k, --key-file PATH               pre-shared RPC authentication key file\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
@@ -120,6 +121,13 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.host = argv[i];
+        } else if (arg == "-k" || arg == "--key-file") {
+            if (++i >= argc) { return false; }
+#ifdef _WIN32
+            if (_putenv_s("GGML_RPC_KEY_FILE", argv[i]) != 0) { return false; }
+#else
+            if (setenv("GGML_RPC_KEY_FILE", argv[i], 1) != 0) { return false; }
+#endif
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 return false;

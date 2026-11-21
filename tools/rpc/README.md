@@ -135,3 +135,24 @@ $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 $ GGML_RPC_DEBUG=2 bin/llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052 -lv 5
 ```
 
+
+### Authentication
+
+Create a shared key and restrict access to its raw bytes:
+
+```sh
+head -c 32 /dev/urandom > key
+chmod 600 key
+export GGML_RPC_KEY_FILE="$PWD/key"
+```
+
+Set `GGML_RPC_KEY_FILE` on every client and server, or use `ggml-rpc-server -k PATH`
+(`--key-file PATH`) on the server. Files must contain 16–4096 bytes and must not be
+group/world-readable. Invalid configured files prevent startup or connection.
+The same key authenticates server-to-server comm links. Without a configured key,
+the existing unauthenticated protocol is unchanged. A keyed endpoint rejects an
+unkeyed peer; authentication reads time out after five seconds.
+
+This mutually authenticates connections but **does not encrypt** traffic. Binding
+to a private address is still recommended. Key-file authentication is currently
+supported on POSIX; Windows rejects configured keys with an error.

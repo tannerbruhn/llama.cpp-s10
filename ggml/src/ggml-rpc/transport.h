@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -19,6 +20,10 @@ struct socket_t {
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+    // TCP-only pre-HELLO read with a five-second deadline.
+    bool auth_send(const void * data, size_t size);
+    bool auth_recv(void * data, size_t size);
+    std::string peer_address() const;
 
     socket_ptr accept();
 
