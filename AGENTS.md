@@ -47,3 +47,11 @@ The GPU assist needs Mesa Rusticl on Panfrost (with the Bifrost int8-dot patch f
    clock caps, the GPU clock, cooling. Sweep `GGML_S10_GPU_FRAC` (the recipes repo has the sweep script) and update the
    presets on every phone; the phones log a warning at server start when the build or clocks differ from what the
    share was tuned for. Not needed for memory/config, speculative decoding or networking changes.
+8. **Profile before building, A/B before adopting.** An optimisation starts from a measured share of the time it can
+   remove (op profile `GGML_S10_OPPROF`, the MTP draft log `LLAMA_MTP_DRAFT_LOG`, the 1 Hz phone sampler): that share
+   is its ceiling, and an estimate without one is not a reason to build it. A ceiling does not predict what the change
+   costs elsewhere (the A55 cores added to the thread pool lost 9 %), so adoption still needs rule 1's A/B. Phone tests
+   run through the shared test harness, which samples clocks, thermal caps, temperatures, CPU busy, memory and guard
+   pauses for every measurement; when the A and B sides of a comparison show different caps or pauses, rerun it
+   instead of quoting it. Keep baseline profiles of plain decode, MTP decode and prompt processing, and redo them on
+   the same triggers as rule 7.
