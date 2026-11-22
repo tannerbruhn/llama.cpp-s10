@@ -1417,6 +1417,130 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+#if defined(__aarch64__) && defined(__linux__)
+// S10: the little (A55) cores as a third fixed-share device beside the GPU (Fable 2.7).
+// GGML_S10_LITTLE=2,3 starts one helper thread per listed CPU, outside the thread pool. In a big int2 mat-mul
+// (decode and MTP checks, <= GGML_S10_LITTLE_COLS columns, >= GGML_S10_LITTLE_MINW million weights) thread 0 hands
+// the helpers the LAST GGML_S10_LITTLE_FRAC of the CPU rows as one fixed slice, the pool's big cores split the rest
+// as before, and thread 0 waits for the helpers before it leaves the op. The helpers never take part in any other
+// op or barrier: as pool members (dynamic chunks, -t 6) a slow core's static share of every small op made decode
+// 9 % slower. Rows are independent, so the output is bit-identical to the pool-only path.
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define S10L_MAX 4
+static struct {
+    int n;
+    float frac;
+    int64_t min_w;
+    int64_t max_cols;
+    int cpus[S10L_MAX];
+    const struct ggml_compute_params * params;
+    struct ggml_tensor * dst;
+    int64_t r0, r1, c1;
+    atomic_int seq;
+    atomic_int done;
+    atomic_int sleeping;
+} g_s10l;
+static int g_s10l_state = -1;   // -1 not initialised, 0 off, 1 on
+
+static void * s10l_main(void * arg) {
+    const int k = (int) (intptr_t) arg;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(g_s10l.cpus[k], &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        fprintf(stderr, "s10-little: helper %d could not be pinned to cpu %d, runs unpinned\n", k, g_s10l.cpus[k]);
+    }
+    int seen = 0;
+    for (;;) {
+        int s;
+        int spins = 0;
+        while ((s = atomic_load_explicit(&g_s10l.seq, memory_order_acquire)) == seen) {
+            if (++spins < 100000) {
+                __asm__ volatile("yield" ::: "memory");
+                continue;
+            }
+            // idle (between requests): sleep until the next job
+            atomic_fetch_add_explicit(&g_s10l.sleeping, 1, memory_order_seq_cst);
+            syscall(SYS_futex, (int *) &g_s10l.seq, FUTEX_WAIT_PRIVATE, seen, NULL, NULL, 0);
+            atomic_fetch_sub_explicit(&g_s10l.sleeping, 1, memory_order_seq_cst);
+            spins = 0;
+        }
+        seen = s;
+        const int64_t n = g_s10l.r1 - g_s10l.r0;
+        const int64_t a = g_s10l.r0 + (n * k / g_s10l.n & ~(int64_t) 1);
+        const int64_t b = k + 1 == g_s10l.n ? g_s10l.r1 : g_s10l.r0 + (n * (k + 1) / g_s10l.n & ~(int64_t) 1);
+        ggml_compute_forward_mul_mat_one_chunk(g_s10l.params, g_s10l.dst, g_s10l.dst->src[0]->type, 1, a, b, 0, g_s10l.c1);
+        atomic_fetch_add_explicit(&g_s10l.done, 1, memory_order_release);
+    }
+    return NULL;
+}
+
+static bool s10l_on(void) {
+    if (g_s10l_state >= 0) {
+        return g_s10l_state == 1;
+    }
+    g_s10l_state = 0;
+    const char * e = getenv("GGML_S10_LITTLE");
+    if (e == NULL || *e == '\0' || strcmp(e, "0") == 0) {
+        return false;
+    }
+    for (const char * p = e; *p && g_s10l.n < S10L_MAX; ) {
+        char * q;
+        const long c = strtol(p, &q, 10);
+        if (q == p) {
+            break;
+        }
+        g_s10l.cpus[g_s10l.n++] = (int) c;
+        p = *q == ',' ? q + 1 : q;
+    }
+    const char * f = getenv("GGML_S10_LITTLE_FRAC");
+    const char * w = getenv("GGML_S10_LITTLE_MINW");
+    const char * c = getenv("GGML_S10_LITTLE_COLS");
+    g_s10l.frac     = f ? (float) atof(f) : 0.06f;
+    g_s10l.min_w    = (int64_t) ((w ? atof(w) : 20.0) * 1e6);
+    g_s10l.max_cols = c ? atoi(c) : 3;
+    if (g_s10l.n == 0 || !(g_s10l.frac > 0.0f && g_s10l.frac < 0.5f)) {
+        fprintf(stderr, "s10-little: GGML_S10_LITTLE=%s / FRAC not usable, off\n", e);
+        return false;
+    }
+    for (int k = 0; k < g_s10l.n; k++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, s10l_main, (void *) (intptr_t) k) != 0) {
+            fprintf(stderr, "s10-little: thread start failed, off\n");
+            return false;   // threads already started stay idle: seq never moves
+        }
+        pthread_detach(t);
+    }
+    fprintf(stderr, "s10-little: %d helper thread(s) on cpu %s, %.3f of the CPU rows of int2 mat-muls with >= %.0f M weights and <= %d columns\n",
+            g_s10l.n, e, g_s10l.frac, g_s10l.min_w / 1e6, (int) g_s10l.max_cols);
+    g_s10l_state = 1;
+    return true;
+}
+
+// thread 0, after the pool barrier (src1 is converted, the GPU job is out)
+static void s10l_post(const struct ggml_compute_params * params, struct ggml_tensor * dst, int64_t r0, int64_t r1, int64_t c1) {
+    g_s10l.params = params;
+    g_s10l.dst = dst;
+    g_s10l.r0 = r0;
+    g_s10l.r1 = r1;
+    g_s10l.c1 = c1;
+    atomic_store_explicit(&g_s10l.done, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_s10l.seq, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_s10l.sleeping, memory_order_seq_cst) > 0) {
+        syscall(SYS_futex, (int *) &g_s10l.seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    }
+}
+
+static void s10l_wait(void) {
+    while (atomic_load_explicit(&g_s10l.done, memory_order_acquire) < g_s10l.n) {
+        __asm__ volatile("yield" ::: "memory");
+    }
+}
+#endif
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1556,6 +1680,19 @@ UseGgmlGemm1:;
         g_s10i2_cur = params->use_ref ? NULL : ggml_s10i2_get(src0, src1, s10ga_rows);
     }
 #endif
+#if defined(__aarch64__) && defined(__linux__)
+    // trailing src0 rows computed by the A55 helpers (s10l_*); written by thread 0, read by all after the barrier
+    static int64_t s10l_rows;
+    if (ith == 0) {
+        s10l_rows = 0;
+        if (g_s10i2_cur != NULL && g_s10i2_cur->key == src0->data && s10l_on() &&
+            ne1 * ne2 * ne3 <= g_s10l.max_cols && ne00 * ne01 >= g_s10l.min_w) {
+            s10l_rows = (int64_t) ((ne0 - s10ga_rows) * g_s10l.frac) & ~(int64_t) 15;
+        }
+    }
+#else
+    const int64_t s10l_rows = 0;
+#endif
 
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
@@ -1570,9 +1707,14 @@ UseGgmlGemm1:;
         ggml_s10ga_submit();
     }
 #endif
+#if defined(__aarch64__) && defined(__linux__)
+    if (ith == 0 && s10l_rows > 0) {
+        s10l_post(params, dst, ne0 - s10l_rows, ne0, ne1 * ne2 * ne3);
+    }
+#endif
 
 #if GGML_USE_LLAMAFILE
-    if (!params->use_ref && src1->type != vec_dot_type && ir0_base == 0) {
+    if (!params->use_ref && src1->type != vec_dot_type && ir0_base == 0 && s10l_rows == 0) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1596,8 +1738,8 @@ UseGgmlGemm2:;
 #endif
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    // (minus the leading rows the GPU computes)
-    const int64_t nr0 = ne0 - ir0_base;
+    // (minus the leading rows the GPU computes and the trailing rows the A55 helpers compute)
+    const int64_t nr0 = ne0 - ir0_base - s10l_rows;
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -1666,6 +1808,12 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+
+#if defined(__aarch64__) && defined(__linux__)
+    if (ith == 0 && s10l_rows > 0) {
+        s10l_wait();
+    }
+#endif
 
 #ifdef GGML_S10_GPU_ASSIST
     if (ir0_base > 0) {
