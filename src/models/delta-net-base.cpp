@@ -572,7 +572,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // ARC-LAB: rollback by replay (independent implementation of the technique described by llamADALL). One
         // base state in S plus separate update records of the last K-1 tokens (two banks: this pass
         // reads one, its records go to the other) instead of K snapshot planes; see ggml_gated_delta_net_replay.
-        GGML_ASSERT(state_rows == nullptr && n_seqs == 1 && g->ne[0] == 1);
+        // S10: state_rows != nullptr = in-place state (GGML_S10_GDN_INPLACE, see qwen35.cpp): `s` is the 2D cache
+        // [D, n_cells] and state_rows the source row; the op reads that row and writes its base state straight into
+        // the destination row (kv_head), so there is no gather before it and no base CPY after it
+        GGML_ASSERT(n_seqs == 1 && g->ne[0] == 1);
         // the memory allocates only the base S plane in replay mode (llama_memory_recurrent::rpl)
         GGML_ASSERT(ssm_states_all->ne[1] == (int64_t) mem_size);
         ggml_tensor * records = mctx_cur->get_rec_l(il);
@@ -587,7 +590,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * rec = ggml_view_3d(ctx0, records, R * (K - 1), 2, n_seqs, rec_size, 2 * rec_size,
                 2 * (size_t) kv_head * rec_size);
 
-        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, rec, inp->s_rpl_ctrl, (int) K);
+        ggml_tensor * state_dst = nullptr;
+        if (state_rows) {
+            state_dst = ggml_view_4d(ctx0, ssm_states_all, S_v, S_v, H_v, n_seqs,
+                    ggml_row_size(ssm_states_all->type, S_v), ggml_row_size(ssm_states_all->type, S_v * S_v),
+                    row_size, (size_t) kv_head * row_size);
+        }
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, state_rows ? state_dst : s, rec,
+                inp->s_rpl_ctrl, (int) K);
+        if (state_rows) {
+            ggml_gated_delta_net_replay_set_inplace(gdn_out, s, state_rows);
+        }
         res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
 
         ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
@@ -601,10 +614,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const size_t base_off = ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs);
         const size_t rec_off  = base_off + ggml_row_size(gdn_out->type, D * n_seqs);
 
-        // base state -> plane 0; records -> the bank s_rpl_wrow picks (the SYCL backend fuses both into the op)
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
-            ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), base_off),
-            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, row_size, (size_t) kv_head * row_size)));
+        // base state -> plane 0 (in place: the op already wrote it); records -> the bank s_rpl_wrow picks (the SYCL
+        // backend fuses both into the op)
+        if (!state_rows) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), base_off),
+                ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, row_size, (size_t) kv_head * row_size)));
+        }
 
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0,
             ggml_view_2d(ctx0, records, R * (K - 1), 2, rec_size, 2 * (size_t) kv_head * rec_size),

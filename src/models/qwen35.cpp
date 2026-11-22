@@ -503,6 +503,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // ARC-LAB: GDN rollback by replay (the memory decides, see llama_memory_recurrent::rpl): the state is the base
     // row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
     const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
+    // S10: replay with the state read and written in place in the cache (no per-layer gather + copy back of the
+    // ~3 MB state). One sequence and no extra states only (nothing to relocate, no row two sequences share).
+    // On by default since 2026-11-22 (MTP +3.8 %, output identical); GGML_S10_GDN_INPLACE=0 = old gather + copy back.
+    static const bool gdn_rpl_inplace_env = [] { const char * e = getenv("GGML_S10_GDN_INPLACE"); return !e || strcmp(e, "0") != 0; }();
+    const bool gdn_rpl_inplace = gdn_rpl && gdn_rpl_inplace_env && n_seqs == 1 && mctx_cur->get_n_rs() == 1;
 
     // Extra relocation can overwrite a source row before GDN reads it. Multiple sequences also need read-before-write ordering.
     const bool gdn_state_rows_safe = n_seqs == 1 && mctx_cur->get_n_rs() == 1;
@@ -511,7 +516,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         gdn_state_rows_env && gdn_state_rows_dev_ok && gdn_state_rows_safe && gdn_state_rows_path && !gdn_rpl;
 
     ggml_tensor * state;
-    if (gdn_rpl) {
+    if (gdn_rpl_inplace) {
+        // same cache hygiene as build_rs (zero a cleared state first, in the graph before the GDN op reads it);
+        // with one state there are no extra states to relocate
+        const int64_t n_embd_s = hparams.n_embd_s();
+        const int32_t rs_zero  = mctx_cur->get_rs_z();
+        state = ggml_reshape_2d(ctx0, ssm_states_all, n_embd_s, ggml_nelements(ssm_states_all) / n_embd_s);
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, state, n_embd_s * (rs_zero >= 0), rs_zero * state->nb[1] * (rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+        cb(state, "state_cache_inplace", il);
+    } else if (gdn_rpl) {
         state = build_rs(ssm_states_all, inp->s_rpl_main, inp->s_rpl_extra, hparams.n_embd_s(), n_seqs,
                 mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -597,7 +611,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
-            gdn_state_rows ? inp->s_copy_main : nullptr);
+            gdn_rpl_inplace ? inp->s_rpl_main : gdn_state_rows ? inp->s_copy_main : nullptr);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

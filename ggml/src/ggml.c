@@ -6629,6 +6629,24 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
     return result;
 }
 
+// S10: see ggml.h
+void ggml_gated_delta_net_replay_set_inplace(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * states,
+        struct ggml_tensor * rows) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET_REPLAY);
+    const struct ggml_tensor * state = gdn->src[5];
+    const int64_t D      = state->ne[0] * state->ne[1] * state->ne[2];
+    const int64_t n_seqs = state->ne[3];
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && states->ne[0] == D && states->nb[0] == sizeof(float));
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && ggml_nelements(rows) == n_seqs);
+
+    ggml_set_op_params_i32(gdn, 1, 1);
+
+    gdn->src[8] = states;
+    gdn->src[9] = rows;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

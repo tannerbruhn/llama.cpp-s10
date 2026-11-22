@@ -2739,6 +2739,16 @@ extern "C" {
             struct ggml_tensor  * ctrl,
             int                   K);
 
+    // S10: in-place state for ggml_gated_delta_net_replay. The op reads seq i's state from row rows[i] of the 2D
+    // cache `states` [D, n_cells] and writes its base state straight into its `state` argument (then a view of the
+    // destination cache row) instead of the packed output, so the caller drops the GET_ROWS gather and the CPY
+    // back. The base region of the output stays allocated but is left unwritten. Only for a single sequence whose
+    // source row is not another sequence's destination.
+    GGML_API void ggml_gated_delta_net_replay_set_inplace(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * rows);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

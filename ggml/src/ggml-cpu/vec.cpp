@@ -1,5 +1,7 @@
 #include "vec.h"
 
+#include <cstdlib>
+
 #include <cassert>
 
 // precomputed gelu table for f16 (128 KB)
@@ -235,6 +237,35 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     vl = __riscv_vsetvlmax_e32m4();
     vfloat32m1_t redsum = __riscv_vfredusum_vs_f32m4_f32m1(vsum0, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl);
     sumf += __riscv_vfmv_f_s_f32m1_f32(redsum);
+
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    // S10: NEON path for cores without the bf16 extension (Cortex-A75 / Exynos M4 have none): bf16 -> f32 is an exact
+    // 16-bit shift, accumulated in f32 like the x86 paths, instead of the scalar double loop below (which was ~2 % of
+    // a 27B decode step: the GDN gate projections). Opt-in (GGML_S10_BF16_NEON=1): the op drops ~11 -> ~3 ms per graph
+    // and perplexity is level, but f32 summation order changes greedy output on some prompts (rule 3) and the end-to-end
+    // gain was within noise (2026-11-22), so the scalar loop stays the default.
+    static const bool s10_bf16_scalar = getenv("GGML_S10_BF16_NEON") == nullptr;
+    if (!s10_bf16_scalar) {
+        float32x4_t c0 = vdupq_n_f32(0.0f);
+        float32x4_t c1 = vdupq_n_f32(0.0f);
+        float32x4_t c2 = vdupq_n_f32(0.0f);
+        float32x4_t c3 = vdupq_n_f32(0.0f);
+#define S10_BF16_LO(v) vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16))
+#define S10_BF16_HI(v) vreinterpretq_f32_u32(vshll_high_n_u16(v, 16))
+        for (; i + 16 <= n; i += 16) {
+            const uint16x8_t x0 = vld1q_u16((const uint16_t *) (x + i));
+            const uint16x8_t x1 = vld1q_u16((const uint16_t *) (x + i + 8));
+            const uint16x8_t y0 = vld1q_u16((const uint16_t *) (y + i));
+            const uint16x8_t y1 = vld1q_u16((const uint16_t *) (y + i + 8));
+            c0 = vfmaq_f32(c0, S10_BF16_LO(x0), S10_BF16_LO(y0));
+            c1 = vfmaq_f32(c1, S10_BF16_HI(x0), S10_BF16_HI(y0));
+            c2 = vfmaq_f32(c2, S10_BF16_LO(x1), S10_BF16_LO(y1));
+            c3 = vfmaq_f32(c3, S10_BF16_HI(x1), S10_BF16_HI(y1));
+        }
+#undef S10_BF16_LO
+#undef S10_BF16_HI
+        sumf += (ggml_float) vaddvq_f32(vaddq_f32(vaddq_f32(c0, c1), vaddq_f32(c2, c3)));
+    }
 
 #elif defined(__POWER9_VECTOR__) || defined(__VXE__) || defined(__VXE2__)
     const int np = (n & ~(GGML_BF16_STEP - 1));

@@ -11703,6 +11703,11 @@ static void ggml_compute_forward_gated_delta_net_replay_f32(
     const ggml_tensor * src_state = dst->src[5];
     const ggml_tensor * src_rec   = dst->src[6];
     const ggml_tensor * src_ctrl  = dst->src[7];
+    // S10 in-place mode (ggml_gated_delta_net_replay_set_inplace): read the state from cache row rows[seq] of
+    // src[8], write the base state into src_state (a view of the destination cache row) instead of the output
+    const bool          inplace   = ggml_get_op_params_i32(dst, 1) != 0;
+    const ggml_tensor * src_cache = dst->src[8];
+    const int32_t     * src_rows  = inplace ? (const int32_t *) dst->src[9]->data : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
@@ -11757,8 +11762,9 @@ static void ggml_compute_forward_gated_delta_net_replay_f32(
         const int64_t ik3 = iv3 / rk3;
 
         // state layout: s[j*S_v + i] = S[i][j] (row j = value column j)
-        memcpy(s, (const char *) src_state->data + iv3 * src_state->nb[3] + iv1 * S_v * S_v * sizeof(float),
-               S_v * S_v * sizeof(float));
+        const char * state_in = inplace ? (const char *) src_cache->data + (size_t) src_rows[iv3] * src_cache->nb[1]
+                                         : (const char *) src_state->data + iv3 * src_state->nb[3];
+        memcpy(s, state_in + iv1 * S_v * S_v * sizeof(float), S_v * S_v * sizeof(float));
 
         // replay: re-apply the stored updates of the tokens kept since the base state
         const int32_t n_rec = ctrl[2 * iv3 + 0];
@@ -11807,7 +11813,10 @@ static void ggml_compute_forward_gated_delta_net_replay_f32(
             attn_data += S_v * H;
 
             if (t == t_base) {
-                memcpy(base_out + (iv3 * H + iv1) * S_v * S_v, s, S_v * S_v * sizeof(float));
+                // in place: each head's slice is read (above) and written (here) by the same thread only
+                float * base_dst = inplace ? (float *) ((char *) src_state->data + iv3 * src_state->nb[3]) + iv1 * S_v * S_v
+                                           : base_out + (iv3 * H + iv1) * S_v * S_v;
+                memcpy(base_dst, s, S_v * S_v * sizeof(float));
             } else if (t > t_base) {
                 float * r = rec_out + iv3 * (K - 1) * R + (t - t_base - 1) * R;
                 memcpy(r + iv1 * S_v,           delta, S_v * sizeof(float));
