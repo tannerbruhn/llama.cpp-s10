@@ -6,8 +6,26 @@
 >
 > - ARM CPU kernels for ternary PTQ1_0: a lean block decoder, a two-row kernel with prefetch, and a prompt kernel
 >   that decodes each row pair once (`ggml/src/ggml-cpu/`).
+> - **New (2026-11-21..23): the GPU assist without OpenCL.** `GGML_S10_GPU_DIRECT=1` submits the assist's kernels
+>   straight to the Panfrost kernel driver as pre-compiled Mali-G76 compute jobs (`ggml/src/ggml-cpu/s10-direct.c`),
+>   instead of going through Mesa Rusticl, whose per-call overhead cancelled much of the GPU's work. Same results:
+>   greedy text identical to the Rusticl path. Mali-G76 (Bifrost v7) only; without it the assist falls back to Rusticl.
+>   Together with `GGML_S10_T0LAST=1` (the thread that drives the GPU runs on a big core) and per-matrix-class GPU
+>   shares (`GGML_S10_GPU_FRAC_UPGATE` / `_DOWN` / `_OTHER`), Ternary Bonsai 2 27B on the second phone, same prompts,
+>   old setup vs new:
+>
+>   | | plain generation (tg32) | served with MTP (mean of 8 answers) |
+>   |---|---|---|
+>   | Rusticl, share 0.30 (previous release) | 1.29-1.35 tok/s | 1.34 tok/s |
+>   | direct, T0LAST, shares 0.55 / 0.47 / 0.45 | 1.90 | 1.84 (+37 %) |
+>   | same, shares 0.60 / 0.52 / 0.50 (runs hotter, fewer heat pauses) | 1.75-1.93 | 2.00 (+49 %) |
+>
+>   Also in this release: the linear-attention rollback state is updated in place (default on; MTP +3.8 %), and the
+>   server's `--spec-draft-p-min 0.7` (skip drafting when the MTP head is unsure) gives prose +10-12 % with identical
+>   output. On the first phone the 27B now serves prose at ~2.1 tok/s.
 > - A Mali GPU assist (`ggml/src/ggml-cpu/s10-gpu-assist.c`, CMake `GGML_CPU_S10_GPU_ASSIST`): the GPU computes part
->   of every PTQ1_0 matrix product over OpenCL (Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s generation.
+>   of every PTQ1_0 matrix product (originally over OpenCL with Mesa Rusticl). Ternary Bonsai 2 27B: 0.48 -> 1.21 tok/s
+>   generation with Rusticl, 1.75-1.93 with direct submission.
 > - A two-token IQ4_NL kernel that reads the weights once for 2-token batches (+21%; speculative-decoding checks),
 >   a faster Q4_0 4x4 gemv, and `LLAMA_ROUTER_DEFAULT_MODEL` for the router server.
 > - Runs Ornith 1.5 9B with its own MTP layer (multi-token prediction): code 3.31 -> 4.07 tok/s (+23%), edits
@@ -43,10 +61,12 @@
 >   estimate is ~1.4 tok/s, above one phone. `GGML_RPC_COMM_PROFILE=1` on the servers prints the per-sync breakdown. Known issue: a
 >   long-lived `ggml-rpc-server` keeps the GPU-assist/int2 copies of a disconnected client's weights; restart it
 >   before each new load.
-> - After any CPU/GPU kernel, clock or cooling change, re-sweep the GPU share `GGML_S10_GPU_FRAC` (AGENTS.md rule 7;
->   currently 0.30).
-> - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`) and thread-0
->   placement (`GGML_S10_T0LAST`): about +2% and within noise, kept for further work.
+>   RPC links can now require a pre-shared key (`GGML_RPC_KEY_FILE`, `rpc-server -k`): mutual HMAC-SHA256
+>   challenge before any command, no per-message cost.
+> - After any CPU/GPU kernel, clock or cooling change, re-sweep the GPU shares (AGENTS.md rule 7; with direct
+>   submission and T0LAST: 0.45 overall, 0.55 / 0.47 / 0.45 per class, 0.05 higher on a phone that runs hot).
+> - Experimental, default off: CPU-GPU overlap tuning (`GGML_S10_GPU_LATE`, `GGML_S10_GPU_QNEON`), A55 helper
+>   threads (`GGML_S10_LITTLE`), a NEON bf16 dot: within noise, kept for further work.
 >
 > **The S10 project.**
 >
